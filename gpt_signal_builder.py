@@ -145,7 +145,7 @@ def build_messages_classify(struct_1w: Dict[str, Any], struct_1d: Dict[str, Any]
     """
     Giữ API cũ: trigger_1h là *full struct 1H*.
     """
-    ctx = {"struct_1w": struct_4h, "struct_1d": struct_1d, "struct_1h": (trigger_1h or {})}
+    ctx = {"struct_1w": struct_1w, "struct_1d": struct_1d}
 
     # === DEBUG: in & ghi JSON đầu vào GPT khi DEBUG_GPT_INPUT=1 ===
     try:
