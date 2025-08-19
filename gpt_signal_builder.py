@@ -152,7 +152,6 @@ def build_messages_classify(struct_1w: Dict[str, Any], struct_1d: Dict[str, Any]
         sym_for_dump = (
             _safe(ctx.get('struct_1w'), 'symbol')
             or _safe(ctx.get('struct_1d'), 'symbol')
-            or _safe(ctx.get('struct_1h'), 'symbol')
             or "SYMBOL"
         )
         debug_print_gpt_input(ctx)
@@ -165,12 +164,12 @@ def build_messages_classify(struct_1w: Dict[str, Any], struct_1d: Dict[str, Any]
         "role": "system",
         "content": (
             "Bạn là trader kỹ thuật. Hãy phân loại một mã thành ENTER / WAIT / AVOID "
-            "dựa trên JSON 3 khung **1W & 1D (đầy đủ)**.\n"
+            "dựa trên JSON 2 khung **1W & 1D (đầy đủ)**.\n"
             "Quy tắc:\n"
             "- ENTER: 1W–1D đồng pha và có xác nhận (breakout/reclaim/retest) với volume ủng hộ; "
             "R:R hợp lý theo targets/levels → cung cấp Entry/SL/TP.\n"
             "- WAIT: xu hướng lớn ủng hộ nhưng thiếu xác nhận ở 1D (nến đang chạy) → chỉ log, kèm trigger_hint (điểm/kịch bản kích hoạt cụ thể).\n"
-            "- AVOID: đi ngược 1D rõ rệt, hoặc R:R xấu/levels tắc/thiếu thanh khoản → log lý do ngắn.\n"
+            "- AVOID: đi ngược 1W rõ rệt, hoặc R:R xấu/levels tắc/thiếu thanh khoản → log lý do ngắn.\n"
             "Chấp nhận RSI>70/<30 nếu đi cùng breakout có volume (không loại oan). "
             "Chỉ trả JSON theo schema sau (tiếng Việt):\n"
             + json.dumps(CLASSIFY_SCHEMA, ensure_ascii=False)
@@ -187,14 +186,14 @@ def build_messages_classify(struct_1w: Dict[str, Any], struct_1d: Dict[str, Any]
 
 
 # ====== Hàm chính: trả về telegram_text/analysis_text theo yêu cầu ======
-def make_telegram_signal(struct_1w: Dict[str, Any], struct_1d: Dict[str, Any], trigger_1h: Optional[Dict[str, Any]] = None, ) -> Dict[str, Any]:
+def make_telegram_signal(struct_1w: Dict[str, Any], struct_1d: Dict[str, Any]) -> Dict[str, Any]:
     """
-    - Gọi GPT-4o với 1W & 1D (không dùng 1H).
-    - Nếu ENTER: tạo telegram_text *đơn giản* (Direction|Mã, Leverage, Entry, SL, TP) + analysis_text để log.
+    - Gọi GPT-4o với 1W & 1D.
+    - Nếu ENTER: tạo telegram_text *đơn giản* (Mã, Entry, SL, TP) + analysis_text để log.
     - Nếu WAIT/AVOID: KHÔNG tạo telegram_text; chỉ trả analysis_text ngắn gọn (WAIT có trigger_hint).
     """
     try:
-        msgs = build_messages_classify(struct_1w, struct_1d, trigger_1h=trigger_1h)
+        msgs = build_messages_classify(struct_1w, struct_1d)
         resp = client.chat.completions.create(
             model=DEFAULT_MODEL,
             messages=msgs,
@@ -219,7 +218,6 @@ def make_telegram_signal(struct_1w: Dict[str, Any], struct_1d: Dict[str, Any], t
 
         decision: Dict[str, Any] = {
             "decision": decision_str,
-            "side": side,
             "confidence": data.get("confidence"),
             "strategy": data.get("strategy"),
             "entries": data.get("entries") or data.get("entry") or [],
@@ -227,7 +225,6 @@ def make_telegram_signal(struct_1w: Dict[str, Any], struct_1d: Dict[str, Any], t
             "tps": data.get("tps") or data.get("tp") or [],
             "reasons": data.get("reasons") or (data.get("analysis") and [data["analysis"]] or []),
             "trigger_hint": data.get("trigger_hint"),
-            "leverage": data.get("leverage"),
             "eta": data.get("eta"),
         }
 
@@ -250,12 +247,10 @@ def make_telegram_signal(struct_1w: Dict[str, Any], struct_1d: Dict[str, Any], t
             plan = {
                 "signal_id": f"{symbol.replace('/', '')}-{int(time.time())}",
                 "timeframe": "1D",
-                "side": decision["side"],
                 "strategy": decision.get("strategy") or "GPT-plan",
                 "entries": decision.get("entries") or [],
                 "sl": decision.get("sl"),
                 "tps": decision.get("tps") or [],
-                "leverage": decision.get("leverage"),
                 "eta": decision.get("eta"),
             }
 
@@ -266,7 +261,6 @@ def make_telegram_signal(struct_1w: Dict[str, Any], struct_1d: Dict[str, Any], t
             "analysis_text": analysis_text,   # luôn có
             "decision": {
                 "action": decision["decision"],
-                "side": decision["side"],
                 "confidence": decision.get("confidence"),
                 "strategy": decision.get("strategy"),
                 "entries": decision.get("entries"),
@@ -274,7 +268,6 @@ def make_telegram_signal(struct_1w: Dict[str, Any], struct_1d: Dict[str, Any], t
                 "tps": decision.get("tps"),
                 "reasons": decision.get("reasons"),
                 "trigger_hint": decision.get("trigger_hint"),
-                "leverage": decision.get("leverage"),
                 "eta": decision.get("eta"),
             },
             "plan": plan,   # chỉ khi ENTER
