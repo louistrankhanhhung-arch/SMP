@@ -1,0 +1,3 @@
+# Additions for VN stock app
+vnstock>=0.2.8
+pytz>=2024.1
