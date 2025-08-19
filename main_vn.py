@@ -3,7 +3,7 @@
 """
 Pipeline: vnstock_api -> indicators -> structure_engine -> gpt_signal_builder
 
-- Khung thời gian: 1W (context), 1D (khung giao dịch), 1H (trigger)
+- Khung thời gian: 1W (context) & 1D (khung giao dịch; nến 1D có thể đang chạy)
 - Long-only; hiện tại chỉ log ra stdout + file. (Telegram sẽ nối sau)
 - Lịch chạy do cron/systemd hẹn giờ.
 
@@ -40,6 +40,31 @@ def setup_logging(logfile: str | None):
         handlers.append(logging.FileHandler(logfile, encoding="utf-8"))
     logging.basicConfig(level=logging.INFO, format=logfmt, datefmt=datefmt, handlers=handlers)
 
+
+def _vn_day_progress(now_local_ts) -> float:
+    """
+    Tính % thời gian giao dịch đã trôi qua trong ngày (VN: 09:00–11:30, 14:00–15:00).
+    Bỏ ATO chi tiết; nếu cần có thể điều chỉnh. Trả về [0.05, 1.0].
+    """
+    import datetime as dt
+    total_minutes = 150 + 60  # 09:00-11:30 = 150'; 14:00-15:00 = 60'
+    sessions = [(dt.time(9,0), dt.time(11,30)), (dt.time(14,0), dt.time(15,0))]
+    passed = 0
+    t = now_local_ts.time()
+
+    # tính phút đã qua trong hai phiên
+    for start, end in sessions:
+        start_dt = dt.datetime.combine(now_local_ts.date(), start, tzinfo=now_local_ts.tzinfo)
+        end_dt   = dt.datetime.combine(now_local_ts.date(), end,   tzinfo=now_local_ts.tzinfo)
+        if t >= end:
+            passed += int((end_dt - start_dt).total_seconds() // 60)
+        elif t > start:
+            now_dt = dt.datetime.combine(now_local_ts.date(), t, tzinfo=now_local_ts.tzinfo)
+            passed += max(0, int((now_dt - start_dt).total_seconds() // 60))
+
+    prog = passed / total_minutes if total_minutes > 0 else 1.0
+    # chặn đáy 5% để tránh chia cho số rất nhỏ đầu phiên
+    return max(0.05, min(1.0, prog))
 # --------------- Utils ---------------
 def drop_partial_last_bar(df: pd.DataFrame) -> pd.DataFrame:
     """Bỏ nến cuối nếu còn đang chạy (index > now_utc)."""
@@ -77,18 +102,29 @@ def process_symbol(symbol: str) -> dict:
             logging.warning(f"{symbol}: Không có dữ liệu 1D.")
             return {"ok": False, "symbol": symbol, "error": "no_1d"}
 
-        df_h = load_and_enrich(symbol, "1H", limit=500)
-        if df_h is None or len(df_h) == 0:
-            logging.warning(f"{symbol}: Không có dữ liệu 1H.")
-            return {"ok": False, "symbol": symbol, "error": "no_1h"}
-
+        # ---- compute volume progress for live 1D ----
+        now_local = pd.Timestamp.now(tz="Asia/Ho_Chi_Minh")
+        day_prog = _vn_day_progress(now_local.to_pydatetime())
+        try:
+            denom = (df_d['vol_sma20'].iloc[-1] or 0) * day_prog
+            if denom <= 0:
+                vol_progress = None
+            else:
+                vol_progress = float(df_d['volume'].iloc[-1]) / float(denom)
+        except Exception:
+            vol_progress = None
+    
         # Build struct cho từng TF (context truyền vào TF nhỏ hơn)
         struct_1w = build_struct_json(symbol, "1W", df_w)  # context top
         struct_1d = build_struct_json(symbol, "1D", df_d, context_df=df_w)
-        struct_1h = build_struct_json(symbol, "1H", df_h, context_df=df_d)
+        try:
+            if vol_progress is not None:
+                struct_1d.setdefault('snapshot', {}).setdefault('volume', {})['progress'] = float(vol_progress)
+        except Exception:
+            pass
 
         # Gọi GPT để phân loại/ra setup
-        gpt = make_telegram_signal(struct_1w, struct_1d, trigger_1h=struct_1h)
+        gpt = make_telegram_signal(struct_1w, struct_1d, trigger_1h=None)
 
         # Logging theo yêu cầu
         if not gpt.get("ok"):
@@ -97,7 +133,7 @@ def process_symbol(symbol: str) -> dict:
 
         decision = (gpt.get("decision") or {}).get("action")
         eta = (gpt.get("decision") or {}).get("tp1_eta_bars")
-        logging.info(f"{symbol}: decision={decision}, tp1_eta_bars={eta}")
+        logging.info(f"{symbol}: decision={decision}, tp1_eta_bars={eta}, vol_progress={struct_1d.get('snapshot',{}).get('volume',{}).get('progress')}")
 
         # always log analysis_text
         if gpt.get("analysis_text"):
@@ -122,7 +158,7 @@ def main():
     args = parser.parse_args()
 
     setup_logging(args.logfile)
-    logging.info("Start VN Signal Pipeline (1W/1D/1H)")
+    logging.info("Start VN Signal Pipeline (1W + 1D; live 1D enabled)")
 
     symbols = resolve_symbols(args.symbols) if args.symbols.strip() else get_universe_from_env()
     logging.info(f"Symbols: {symbols}")
