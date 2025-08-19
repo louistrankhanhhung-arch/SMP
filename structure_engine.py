@@ -2,8 +2,6 @@
 from typing import List, Dict, Any, Tuple, Optional
 import numpy as np
 import pandas as pd
-from indicators import enrich_indicators, enrich_more
-df = enrich_more(enrich_indicators(df))
 
 # =====================================================
 # 1) Zigzag & Swings (đơn giản)
@@ -455,6 +453,26 @@ def build_struct_json(
         # ---- cập nhật targets & eta đối xứng ----
         "targets": {"up_bands": bands_up, "down_bands": bands_dn},
         "eta_hint": {"method": "ATR", "per": "bar", "up_bands": eta_up, "down_bands": eta_dn},
+        # ---- ETA→TP mapping for GPT (long-first) ----
+        "tp_eta_map": {
+            "up": [
+                {"tp": float(b["tp"]), "band": b["band"], "eta_bars": int(e["eta_bars"]), "eta_days": float(e["eta_days"])}
+                for b, e in zip(bands_up, eta_up)
+            ],
+            "down": [
+                {"tp": float(b["tp"]), "band": b["band"], "eta_bars": int(e["eta_bars"]), "eta_days": float(e["eta_days"])}
+                for b, e in zip(bands_dn, eta_dn)
+            ],
+        },
+        "long_tp_hint": (lambda _pairs: {
+            "tp_list": [p["tp"] for p in _pairs[:3]],
+            "tp1_eta_bars": (int(_pairs[0]["eta_bars"]) if _pairs else None),
+            "tp1_eta_days": (float(_pairs[0]["eta_days"]) if _pairs else None),
+        })([
+            {"tp": float(b["tp"]), "eta_bars": int(e["eta_bars"]), "eta_days": float(e["eta_days"])}
+            for b, e in zip(bands_up, eta_up)
+        ]),
+
         "confirmations": {"volume": volc, "candles": cndl},
         # Sự kiện: breakout + breakdown + cờ volume cho cả hai chiều
         "events": {
@@ -499,5 +517,19 @@ def build_struct_json(
             "nearest_support": ctx_next_dn[0] if ctx_next_dn else None,
             "soft_nearest_support": (ctx_soft_dn[0] if ctx_soft_dn else None),
         }
+
+    # Optional: liquidity zones (truyền từ ngoài để tái sử dụng/tùy biến tham số)
+    if liquidity_zones is not None:
+        struct["liquidity_zones"] = liquidity_zones
+
+    # Futures sentiment: nếu caller không truyền, cố gắng tự fetch
+    if futures_sentiment is not None:
+        struct["futures_sentiment"] = futures_sentiment
+    else:
+        try:
+            from indicators import fetch_funding_oi
+            struct["futures_sentiment"] = fetch_funding_oi(symbol)
+        except Exception as e:
+            struct["futures_sentiment"] = {"error": str(e)}
 
     return struct
