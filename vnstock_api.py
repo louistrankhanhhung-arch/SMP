@@ -210,3 +210,10 @@ def fetch_ohlcv(symbol: str, timeframe: Literal["1H","1D","1W"] = "1D", limit: i
 
     out = _resample_ohlcv(intraday, rule="1H").tail(limit)
     return out
+
+def drop_partial_last_bar(df_1h: pd.DataFrame) -> pd.DataFrame:
+    """Bỏ nến 1H cuối nếu còn đang chạy (label > 'bây giờ')."""
+    if df_1h.empty:
+        return df_1h
+    now_utc = pd.Timestamp.utcnow().tz_localize("UTC")
+    return df_1h.iloc[:-1] if df_1h.index[-1] > now_utc else df_1h
