@@ -149,18 +149,14 @@ def build_messages_classify(
     """
     Giữ API cũ: trigger_1h là *full struct 1H*.
     """
-    ctx = {
-        "struct_4h": struct_4h,
-        "struct_1d": struct_1d,
-        "struct_1h": (trigger_1h or {}),
-    }
+    ctx = {"struct_1w": struct_4h, "struct_1d": struct_1d, "struct_1h": (trigger_1h or {})}
 
     # === DEBUG: in & ghi JSON đầu vào GPT khi DEBUG_GPT_INPUT=1 ===
     try:
         sym_for_dump = (
-            _safe(struct_4h, "symbol")
-            or _safe(struct_1d, "symbol")
-            or _safe(trigger_1h, "symbol")
+            _safe(ctx.get('struct_1w'), 'symbol')
+            or _safe(ctx.get('struct_1d'), 'symbol')
+            or _safe(ctx.get('struct_1h'), 'symbol')
             or "SYMBOL"
         )
         debug_print_gpt_input(ctx)
@@ -173,11 +169,11 @@ def build_messages_classify(
         "role": "system",
         "content": (
             "Bạn là trader kỹ thuật. Hãy phân loại một mã thành ENTER / WAIT / AVOID "
-            "dựa trên JSON 3 khung **1D / 4H / 1H (đầy đủ)**.\n"
+            "dựa trên JSON 3 khung **1W & 1D (đầy đủ)**.\n"
             "Quy tắc:\n"
-            "- ENTER: 1D–4H–1H đồng pha và có xác nhận (breakout/reclaim/retest) với volume ủng hộ; "
+            "- ENTER: 1W–1D đồng pha và có xác nhận (breakout/reclaim/retest) với volume ủng hộ; "
             "R:R hợp lý theo targets/levels → cung cấp Entry/SL/TP.\n"
-            "- WAIT: xu hướng lớn ủng hộ nhưng thiếu xác nhận 1H → chỉ log, kèm trigger_hint (điểm/kịch bản kích hoạt cụ thể).\n"
+            "- WAIT: xu hướng lớn ủng hộ nhưng thiếu xác nhận ở 1D (nến đang chạy) → chỉ log, kèm trigger_hint (điểm/kịch bản kích hoạt cụ thể).\n"
             "- AVOID: đi ngược 1D rõ rệt, hoặc R:R xấu/levels tắc/thiếu thanh khoản → log lý do ngắn.\n"
             "Chấp nhận RSI>70/<30 nếu đi cùng breakout có volume (không loại oan). "
             "Chỉ trả JSON theo schema sau (tiếng Việt):\n"
@@ -187,7 +183,7 @@ def build_messages_classify(
     user = {
         "role": "user",
         "content": [
-            {"type": "text", "text": "Context JSON (1D/4H/1H):"},
+            {"type": "text", "text": "Context JSON (1W & 1D):"},
             {"type": "text", "text": json.dumps(ctx, ensure_ascii=False)},
         ],
     }
@@ -201,7 +197,7 @@ def make_telegram_signal(
     trigger_1h: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    - Gọi GPT-4o với 1H/4H/1D đầy đủ.
+    - Gọi GPT-4o với 1W & 1D (không dùng 1H).
     - Nếu ENTER: tạo telegram_text *đơn giản* (Direction|Mã, Leverage, Entry, SL, TP) + analysis_text để log.
     - Nếu WAIT/AVOID: KHÔNG tạo telegram_text; chỉ trả analysis_text ngắn gọn (WAIT có trigger_hint).
     """
@@ -261,7 +257,7 @@ def make_telegram_signal(
         if decision["decision"] == "ENTER":
             plan = {
                 "signal_id": f"{symbol.replace('/', '')}-{int(time.time())}",
-                "timeframe": "4H",
+                "timeframe": "1D",
                 "side": decision["side"],
                 "strategy": decision.get("strategy") or "GPT-plan",
                 "entries": decision.get("entries") or [],
@@ -297,4 +293,4 @@ def make_telegram_signal(
         }
 
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False,
