@@ -4,6 +4,40 @@ import numpy as np
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Literal
 
+def _rename_ohlcv_if_needed(df: pd.DataFrame) -> pd.DataFrame:
+    \"\"\"Map various vendor column names to standard OHLCV.
+    Only fills missing standards; does not override if already present.
+    \"\"\"
+    if df is None or len(df) == 0:
+        return df
+    rename_map = {
+        # common variants for OHLC
+        "openPrice": "open",
+        "highestPrice": "high",
+        "lowestPrice": "low",
+        "closePrice": "close",
+        "matchPrice": "close",
+        "matchedPrice": "close",
+        "price": "close",
+        # volume variants
+        "vol": "volume",
+        "volumeMatched": "volume",
+        "accumulatedVol": "volume",
+        "accumulatedVolume": "volume",
+        "totalVolume": "volume",
+        "nmVolume": "volume",
+        "volumeMatch": "volume",
+    }
+    # only rename when target not already present
+    safe_map = {}
+    for k, v in rename_map.items():
+        if k in df.columns and v not in df.columns:
+            safe_map[k] = v
+    if safe_map:
+        df = df.rename(columns=safe_map)
+    return df
+
+
 # =============================
 # VNStock OHLCV fetcher (1H-1D-1W)
 # - Index: UTC timestamps
@@ -82,6 +116,10 @@ def _fetch_daily_gen2(symbol: str, start: str, end: str) -> pd.DataFrame:
             df = df.rename(columns={"date": "datetime"})
         if "datetime" not in df.columns:
             return pd.DataFrame(columns=["open","high","low","close","volume"])
+        df = _rename_ohlcv_if_needed(df)
+        df = _rename_ohlcv_if_needed(df)
+        df = _rename_ohlcv_if_needed(df)
+        df = _rename_ohlcv_if_needed(df)
         return _to_utc_index(df, "datetime")
     except Exception:
         return pd.DataFrame(columns=["open","high","low","close","volume"])
@@ -101,6 +139,10 @@ def _fetch_daily_legacy(symbol: str, start: str, end: str) -> pd.DataFrame:
                 df = df.reset_index().rename(columns={df.index.name:"datetime"})
             else:
                 df["datetime"] = pd.to_datetime(df.index)
+        df = _rename_ohlcv_if_needed(df)
+        df = _rename_ohlcv_if_needed(df)
+        df = _rename_ohlcv_if_needed(df)
+        df = _rename_ohlcv_if_needed(df)
         return _to_utc_index(df, "datetime")
     except Exception:
         return pd.DataFrame(columns=["open","high","low","close","volume"])
@@ -123,6 +165,10 @@ def _fetch_intraday_gen2(symbol: str) -> pd.DataFrame:
                 df["datetime"] = pd.to_datetime(df["tradingDate"] + " " + df["tradingTime"], errors="coerce")
             else:
                 return pd.DataFrame(columns=["open","high","low","close","volume"])
+        df = _rename_ohlcv_if_needed(df)
+        df = _rename_ohlcv_if_needed(df)
+        df = _rename_ohlcv_if_needed(df)
+        df = _rename_ohlcv_if_needed(df)
         return _to_utc_index(df, "datetime")
     except Exception:
         return pd.DataFrame(columns=["open","high","low","close","volume"])
@@ -134,6 +180,10 @@ def _fetch_intraday_legacy(symbol: str) -> pd.DataFrame:
         df = stock_intraday_data(symbol=symbol, page_num=0, page_size=100000)
         if "time" in df.columns:
             df = df.rename(columns={"time":"datetime"})
+        df = _rename_ohlcv_if_needed(df)
+        df = _rename_ohlcv_if_needed(df)
+        df = _rename_ohlcv_if_needed(df)
+        df = _rename_ohlcv_if_needed(df)
         return _to_utc_index(df, "datetime")
     except Exception:
         return pd.DataFrame(columns=["open","high","low","close","volume"])
@@ -159,6 +209,7 @@ def _approx_intraday_from_daily(daily: pd.DataFrame) -> pd.DataFrame:
                 "volume": float(row["volume"]) / 3.0,
             })
     tmp = pd.DataFrame(reps)
+    tmp = _rename_ohlcv_if_needed(tmp)
     return _to_utc_index(tmp, "datetime")
 
 def fetch_ohlcv(symbol: str, timeframe: Literal["1H","1D","1W"] = "1D", limit: int = 300) -> pd.DataFrame:
@@ -210,10 +261,3 @@ def fetch_ohlcv(symbol: str, timeframe: Literal["1H","1D","1W"] = "1D", limit: i
 
     out = _resample_ohlcv(intraday, rule="1H").tail(limit)
     return out
-
-def drop_partial_last_bar(df_1h: pd.DataFrame) -> pd.DataFrame:
-    """Bỏ nến 1H cuối nếu còn đang chạy (label > 'bây giờ')."""
-    if df_1h.empty:
-        return df_1h
-    now_utc = pd.Timestamp.utcnow().tz_localize("UTC")
-    return df_1h.iloc[:-1] if df_1h.index[-1] > now_utc else df_1h
