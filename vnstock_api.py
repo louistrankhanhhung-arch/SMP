@@ -100,7 +100,11 @@ def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
 
     out = pd.concat([o,h,l,c,v], axis=1)
     out.columns = ["open","high","low","close","volume"]
-    out = out.dropna(how="any").sort_index()
+    out = out.dropna(subset=["close"]).sort_index()
+    out["open"] = out["open"].fillna(out["close"])
+    out["high"] = out["high"].fillna(out["close"])
+    out["low"] = out["low"].fillna(out["close"])
+    out["volume"] = out["volume"].fillna(0)
     return out
 
 def _fetch_daily_gen2(symbol: str, start: str, end: str) -> pd.DataFrame:
@@ -154,7 +158,10 @@ def _fetch_intraday_gen2(symbol: str) -> pd.DataFrame:
         stock = Vnstock().stock(symbol=symbol, source="VCI")
         intraday = None
         if hasattr(stock.quote, "intraday"):
-            intraday = stock.quote.intraday(symbol=symbol, page_size=200000, show_log=False)
+            intraday = stock.quote.intraday(symbol=symbol, page_size=50000, show_log=False)
+        if intraday is None or len(intraday) == 0:
+            # RETRY_SMALLER: thử lại với page_size nhỏ hơn để tránh quá tải
+            intraday = stock.quote.intraday(symbol=symbol, page_size=20000, show_log=False)
         if intraday is None or len(intraday) == 0:
             return pd.DataFrame(columns=["open","high","low","close","volume"])
         df = intraday.copy()
@@ -243,7 +250,12 @@ def fetch_ohlcv(symbol: str, timeframe: Literal["1H","1D","1W"] = "1D", limit: i
         v = daily["volume"].resample("W-FRI", label="right", closed="right").sum()
         out = pd.concat([o,h,l,c,v], axis=1)
         out.columns = ["open","high","low","close","volume"]
-        out = out.dropna(how="any").sort_index()
+        out = out.dropna(subset=["close"])
+        out["open"] = out["open"].fillna(out["close"])
+        out["high"] = out["high"].fillna(out["close"])
+        out["low"]  = out["low"].fillna(out["close"])
+        out["volume"] = out["volume"].fillna(0)
+        out = out.sort_index()
         return out.tail(limit)
 
     # ----- 1H path: intraday → resample 1H → fallback from daily -----
@@ -259,5 +271,5 @@ def fetch_ohlcv(symbol: str, timeframe: Literal["1H","1D","1W"] = "1D", limit: i
             return daily
         intraday = _approx_intraday_from_daily(daily)
 
-    out = _resample_ohlcv(intraday, rule="1H").tail(limit)
+    out = _resample_ohlcv(intraday, rule="1h").tail(limit)
     return out
