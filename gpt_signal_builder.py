@@ -217,15 +217,16 @@ def build_messages_classify(
     system = {
         "role": "system",
         "content": (
-            "Bạn là trader kỹ thuật. Hãy phân loại một mã thành ENTER / WAIT / AVOID dựa trên JSON 3 khung **1D / 1W / 1H (đầy đủ)**.
-Quy tắc:
-- ENTER: 1D–1W–1H đồng pha và có xác nhận (breakout/reclaim/retest) với volume ủng hộ; R:R hợp lý theo targets/levels → cung cấp Entry/SL/TP.
-- WAIT: xu hướng lớn ủng hộ nhưng thiếu xác nhận 1H → chỉ log, kèm trigger_hint (điểm/kịch bản kích hoạt cụ thể).
-- AVOID: đi ngược 1D rõ rệt, hoặc R:R xấu/levels tắc/thiếu thanh khoản → log lý do ngắn.
-Chỉ tư vấn **LONG** (không đưa ra SHORT, không dùng leverage).
-Định dạng giá theo **sàn**: HOSE/HNX/UPCoM dùng **số nguyên VND**; phái sinh (nếu có) dùng **1 chữ số thập phân**; nếu không rõ thì mặc định số nguyên.
-JSON đầu ra (tiếng Việt) phải theo schema sau, có trường `tp1_eta_bars` là **số phiên 1D** ước tính để chạm TP1:
-" + json.dumps(CLASSIFY_SCHEMA, ensure_ascii=False)
+            "Bạn là trader kỹ thuật. Hãy phân loại một mã thành ENTER / WAIT / AVOID "
+            "dựa trên JSON 3 khung **1D / 1W / 1H (đầy đủ)**.\n"
+            "Quy tắc:\n"
+            "- ENTER: 1D–1W–1H đồng pha và có xác nhận (breakout/reclaim/retest) với volume ủng hộ; R:R hợp lý theo targets/levels → cung cấp Entry/SL/TP.\n"
+            "- WAIT: xu hướng lớn ủng hộ nhưng thiếu xác nhận 1H → chỉ log, kèm trigger_hint (điểm/kịch bản kích hoạt cụ thể).\n"
+            "- AVOID: đi ngược 1D rõ rệt, hoặc R:R xấu/levels tắc/thiếu thanh khoản → log lý do ngắn.\n"
+            "Chỉ tư vấn **LONG** (không đưa ra SHORT, không dùng leverage).\n"
+            "Định dạng giá theo **sàn**: HOSE/HNX/UPCoM dùng **số nguyên VND**; phái sinh (nếu có) dùng **1 chữ số thập phân**; nếu không rõ thì mặc định số nguyên.\n"
+            "JSON đầu ra (tiếng Việt) phải theo schema sau, có trường `tp1_eta_bars` là **số phiên 1D** ước tính để chạm TP1:\n"
+            + json.dumps(CLASSIFY_SCHEMA, ensure_ascii=False)
         ),
     }
     user = {
