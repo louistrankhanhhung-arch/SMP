@@ -5,9 +5,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Literal
 
 def _rename_ohlcv_if_needed(df: pd.DataFrame) -> pd.DataFrame:
-    \"\"\"Map various vendor column names to standard OHLCV.
+    """Map various vendor column names to standard OHLCV.
     Only fills missing standards; does not override if already present.
-    \"\"\"
+    """
     if df is None or len(df) == 0:
         return df
     rename_map = {
