@@ -124,7 +124,7 @@ def process_symbol(symbol: str) -> dict:
             pass
 
         # Gọi GPT để phân loại/ra setup
-        gpt = make_telegram_signal(struct_1w, struct_1d, trigger_1h=None)
+        gpt = make_telegram_signal(struct_1w, struct_1d)
 
         # Logging theo yêu cầu
         if not gpt.get("ok"):
