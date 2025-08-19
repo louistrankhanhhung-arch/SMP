@@ -151,9 +151,9 @@ def _render_simple_signal(symbol: str, decision: Dict[str, Any]) -> str:
 
     body = [
         f"{symbol.replace('/', '')}",
-        f"Entry: {_fmt_list_int(entries)}",
-        f"SL: {_fmt_one_int(sl)}",
-        f"TP: {_fmt_list_int(tps)}",
+        f"Entry: {_fmt_price_list_by_exchange(entries, symbol)}",
+        f"SL: {_fmt_price_by_exchange(sl, symbol)}",
+        f"TP: {_fmt_price_list_by_exchange(tps, symbol)}",
     ]
     return "\n".join(body)
 
@@ -231,7 +231,7 @@ JSON đầu ra (tiếng Việt) phải theo schema sau, có trường `tp1_eta_b
     user = {
         "role": "user",
         "content": [
-            {"type": "text", "text": "Context JSON (1D/4H/1H):"},
+            {"type": "text", "text": "Context JSON (1D / 1W / 1H):"},
             {"type": "text", "text": json.dumps(ctx, ensure_ascii=False)},
         ],
     }
