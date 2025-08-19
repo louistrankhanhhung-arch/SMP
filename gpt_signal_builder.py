@@ -141,11 +141,7 @@ def _analysis_text(symbol: str, decision: Dict[str, Any]) -> str:
 
 
 # ====== Prompt xây dựng ======
-def build_messages_classify(
-    struct_4h: Dict[str, Any],
-    struct_1d: Dict[str, Any],
-    trigger_1h: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
+def build_messages_classify(struct_1w: Dict[str, Any], struct_1d: Dict[str, Any], trigger_1h: Optional[Dict[str, Any]] = None, ) -> List[Dict[str, Any]]:
     """
     Giữ API cũ: trigger_1h là *full struct 1H*.
     """
@@ -191,18 +187,14 @@ def build_messages_classify(
 
 
 # ====== Hàm chính: trả về telegram_text/analysis_text theo yêu cầu ======
-def make_telegram_signal(
-    struct_4h: Dict[str, Any],
-    struct_1d: Dict[str, Any],
-    trigger_1h: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+def make_telegram_signal(struct_1w: Dict[str, Any], struct_1d: Dict[str, Any], trigger_1h: Optional[Dict[str, Any]] = None, ) -> Dict[str, Any]:
     """
     - Gọi GPT-4o với 1W & 1D (không dùng 1H).
     - Nếu ENTER: tạo telegram_text *đơn giản* (Direction|Mã, Leverage, Entry, SL, TP) + analysis_text để log.
     - Nếu WAIT/AVOID: KHÔNG tạo telegram_text; chỉ trả analysis_text ngắn gọn (WAIT có trigger_hint).
     """
     try:
-        msgs = build_messages_classify(struct_4h, struct_1d, trigger_1h=trigger_1h)
+        msgs = build_messages_classify(struct_1w, struct_1d, trigger_1h=trigger_1h)
         resp = client.chat.completions.create(
             model=DEFAULT_MODEL,
             messages=msgs,
@@ -218,7 +210,7 @@ def make_telegram_signal(
         # Chuẩn hoá fields
         symbol = (
             data.get("symbol")
-            or _safe(struct_4h, "symbol")
+            or _safe(struct_1w, "symbol")
             or _safe(struct_1d, "symbol")
             or "SYMBOL"
         )
@@ -293,4 +285,4 @@ def make_telegram_signal(
         }
 
     except Exception as e:
-        return {"ok": False,
+        return {"ok": False, "error": str(e)}
