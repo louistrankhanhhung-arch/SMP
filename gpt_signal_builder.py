@@ -22,23 +22,19 @@ client = OpenAI()
 
 # ====== Schema output mong đợi từ GPT ======
 CLASSIFY_SCHEMA = {
-    "symbol": "BTC/USDT",
+    "symbol": "CTG",
     "decision": "ENTER | WAIT | AVOID",
-    "side": "long | short",
     "confidence": 0.0,
     "strategy": "trend-follow | breakout | retest | reclaim | range | countertrend",
-    "entry": [0.0],   # hoặc "entries"
+    "entry": [0.0],
     "entries": [0.0],
     "sl": 0.0,
-    "tp": [0.0, 0.0],  # hoặc "tps"
+    "tp": [0.0, 0.0],
     "tps": [0.0, 0.0],
     "reasons": ["..."],
     "trigger_hint": "nếu WAIT: nêu điều kiện kích hoạt",
-    "leverage": None,
-    "eta": None,
+    "tp1_eta_bars": 3
 }
-
-
 # ====== Helpers ======
 def _safe(d: Optional[Dict], *keys, default=None):
     cur = d or {}
@@ -79,36 +75,85 @@ def _parse_json_from_text(txt: str) -> Dict[str, Any]:
         return {}
 
 
+
+
+
+# ====== Exchange-aware price formatting ======
+def _resolve_exchange(symbol: str) -> str:
+    # 1) ENV VN_EXCHANGE_MAP (JSON: {"FPT":"HOSE","SSI":"HOSE",...})
+    # 2) ENV DEFAULT_EXCHANGE (mặc định "HOSE")
+    import os, json
+    default_ex = os.getenv("DEFAULT_EXCHANGE", "HOSE").upper()
+    try:
+        mapping = json.loads(os.getenv("VN_EXCHANGE_MAP","{}"))
+        mapping = {k.upper(): (v or "").upper() for k,v in mapping.items()}
+    except Exception:
+        mapping = {}
+    return mapping.get(symbol.replace("/", "").upper(), default_ex)
+
+def _exchange_decimals(exchange: str) -> int:
+    # Default decimals by exchange; override via ENV EXCHANGE_DECIMALS_JSON
+    import os, json
+    default = {"HOSE":0, "HSX":0, "HNX":0, "UPCOM":0, "UPCoM":0, "DERIV":1, "FUTURES":1}
+    try:
+        cfg = json.loads(os.getenv("EXCHANGE_DECIMALS_JSON","{}"))
+        for k,v in cfg.items():
+            default[str(k).upper()] = int(v)
+    except Exception:
+        pass
+    return default.get((exchange or "").upper(), 0)
+
+def _fmt_price_by_exchange(x, symbol: str) -> str:
+    ex = _resolve_exchange(symbol)
+    dec = _exchange_decimals(ex)
+    try:
+        fx = float(x)
+        if dec <= 0:
+            return f"{int(round(fx))}"
+        return f"{fx:.{dec}f}"
+    except Exception:
+        return str(x)
+
+def _fmt_price_list_by_exchange(nums, symbol: str) -> str:
+    if not nums:
+        return "-"
+    return ", ".join(_fmt_price_by_exchange(x, symbol) for x in nums)
 def _render_simple_signal(symbol: str, decision: Dict[str, Any]) -> str:
     """
-    Format Telegram *chỉ dùng khi ENTER*:
-    {Direction} | {Mã}
-    Leverage:
+    Format Telegram (VN stock):
+    {Mã}
     Entry:
     SL:
     TP:
     """
-    side = (decision.get("side") or "long").lower()
-    direction = "Long" if side == "long" else "Short"
-    leverage = decision.get("leverage")
     entries = decision.get("entries") or decision.get("entry") or []
     tps = decision.get("tps") or decision.get("tp") or []
     sl = decision.get("sl")
 
-    def _fmt_list(nums):
+    def _fmt_list_int(nums):
         if not nums:
             return "-"
+        out = []
+        for x in nums:
+            try:
+                out.append(f"{int(float(x))}")
+            except Exception:
+                out.append(str(x))
+        return ", ".join(out)
+
+    def _fmt_one_int(x):
+        if x is None:
+            return "-"
         try:
-            return ", ".join(f"{float(x):.6f}" for x in nums)
+            return f"{int(float(x))}"
         except Exception:
-            return ", ".join(str(x) for x in nums)
+            return str(x)
 
     body = [
-        f"{direction} | {symbol.replace('/', '')}",
-        f"Leverage: {leverage if leverage is not None else '-'}",
-        f"Entry: {_fmt_list(entries)}",
-        f"SL: {('-' if sl is None else (f'{float(sl):.6f}' if isinstance(sl, (int, float, str)) else str(sl)))}",
-        f"TP: {_fmt_list(tps)}",
+        f"{symbol.replace('/', '')}",
+        f"Entry: {_fmt_list_int(entries)}",
+        f"SL: {_fmt_one_int(sl)}",
+        f"TP: {_fmt_list_int(tps)}",
     ]
     return "\n".join(body)
 
@@ -172,22 +217,21 @@ def build_messages_classify(
     system = {
         "role": "system",
         "content": (
-            "Bạn là trader kỹ thuật. Hãy phân loại một mã thành ENTER / WAIT / AVOID "
-            "dựa trên JSON 3 khung **1D / 1W / 1H (đầy đủ)**.\n"
-            "Quy tắc:\n"
-            "- ENTER: 1D–1W–1H đồng pha và có xác nhận (breakout/reclaim/retest) với volume ủng hộ; "
-            "R:R hợp lý theo targets/levels → cung cấp Entry/SL/TP.\n"
-            "- WAIT: xu hướng lớn ủng hộ nhưng thiếu xác nhận 1H → chỉ log, kèm trigger_hint (điểm/kịch bản kích hoạt cụ thể).\n"
-            "- AVOID: đi ngược 1D rõ rệt, hoặc R:R xấu/levels tắc/thiếu thanh khoản → log lý do ngắn.\n"
-            "Chấp nhận RSI>70/<30 nếu đi cùng breakout có volume (không loại oan). "
-            "Chỉ trả JSON theo schema sau (tiếng Việt):\n"
-            + json.dumps(CLASSIFY_SCHEMA, ensure_ascii=False)
+            "Bạn là trader kỹ thuật. Hãy phân loại một mã thành ENTER / WAIT / AVOID dựa trên JSON 3 khung **1D / 1W / 1H (đầy đủ)**.
+Quy tắc:
+- ENTER: 1D–1W–1H đồng pha và có xác nhận (breakout/reclaim/retest) với volume ủng hộ; R:R hợp lý theo targets/levels → cung cấp Entry/SL/TP.
+- WAIT: xu hướng lớn ủng hộ nhưng thiếu xác nhận 1H → chỉ log, kèm trigger_hint (điểm/kịch bản kích hoạt cụ thể).
+- AVOID: đi ngược 1D rõ rệt, hoặc R:R xấu/levels tắc/thiếu thanh khoản → log lý do ngắn.
+Chỉ tư vấn **LONG** (không đưa ra SHORT, không dùng leverage).
+Định dạng giá theo **sàn**: HOSE/HNX/UPCoM dùng **số nguyên VND**; phái sinh (nếu có) dùng **1 chữ số thập phân**; nếu không rõ thì mặc định số nguyên.
+JSON đầu ra (tiếng Việt) phải theo schema sau, có trường `tp1_eta_bars` là **số phiên 1D** ước tính để chạm TP1:
+" + json.dumps(CLASSIFY_SCHEMA, ensure_ascii=False)
         ),
     }
     user = {
         "role": "user",
         "content": [
-            {"type": "text", "text": "Context JSON (1D/1W/1H):"},
+            {"type": "text", "text": "Context JSON (1D/4H/1H):"},
             {"type": "text", "text": json.dumps(ctx, ensure_ascii=False)},
         ],
     }
@@ -195,15 +239,18 @@ def build_messages_classify(
 
 
 # ====== Hàm chính: trả về telegram_text/analysis_text theo yêu cầu ======
+
 def make_telegram_signal(
     struct_4h: Dict[str, Any],
     struct_1d: Dict[str, Any],
     trigger_1h: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    - Gọi GPT-4o với 1H/1W/1D đầy đủ.
-    - Nếu ENTER: tạo telegram_text *đơn giản* (Direction|Mã, Leverage, Entry, SL, TP) + analysis_text để log.
-    - Nếu WAIT/AVOID: KHÔNG tạo telegram_text; chỉ trả analysis_text ngắn gọn (WAIT có trigger_hint).
+    - Gọi GPT-4o với 1H/1W/1D đầy đủ. LONG-only. Không leverage.
+    - Quy tắc gửi Telegram:
+        * ENTER **hoặc** WAIT, nếu `tp1_eta_bars` < 5 phiên → gửi setup (Mã, Entry, SL, TP) + log.
+        * WAIT với `tp1_eta_bars` >= 5 hoặc không có → chỉ log hiện trạng + trigger.
+        * AVOID → chỉ log hiện trạng + lý do ngắn.
     """
     try:
         msgs = build_messages_classify(struct_4h, struct_1d, trigger_1h=trigger_1h)
@@ -219,7 +266,6 @@ def make_telegram_signal(
         if not isinstance(data, dict) or not data:
             return {"ok": False, "error": "GPT không trả JSON hợp lệ", "raw": raw}
 
-        # Chuẩn hoá fields
         symbol = (
             data.get("symbol")
             or _safe(struct_4h, "symbol")
@@ -227,7 +273,7 @@ def make_telegram_signal(
             or "SYMBOL"
         )
         decision_str = (data.get("decision") or data.get("action") or "WAIT").upper()
-        side = (data.get("side") or "long").lower()
+        side = "long"  # long-only
 
         decision: Dict[str, Any] = {
             "decision": decision_str,
@@ -239,43 +285,41 @@ def make_telegram_signal(
             "tps": data.get("tps") or data.get("tp") or [],
             "reasons": data.get("reasons") or (data.get("analysis") and [data["analysis"]] or []),
             "trigger_hint": data.get("trigger_hint"),
-            "leverage": data.get("leverage"),
-            "eta": data.get("eta"),
+            "tp1_eta_bars": _get_tp1_eta_bars(data),
         }
 
-        # Tạo output theo 3 nhánh
-        telegram_text = None
         analysis_text = _analysis_text(symbol, decision)
+        telegram_text = None
 
-        if decision_str == "ENTER":
+        eta_bars = decision.get("tp1_eta_bars")
+        if decision_str in ("ENTER", "WAIT") and (eta_bars is not None) and (eta_bars < 5):
             telegram_text = _render_simple_signal(symbol, decision)
-        elif decision_str in ("WAIT", "AVOID"):
-            telegram_text = None
+        elif decision_str == "ENTER":
+            # ENTER nhưng không có ETA -> vẫn gửi
+            telegram_text = _render_simple_signal(symbol, decision)
         else:
-            # Bất ngờ/khác → coi như WAIT
-            decision["decision"] = "WAIT"
             telegram_text = None
 
-        # Gợi ý "plan" tối giản cho dòng post/track
         plan = None
-        if decision["decision"] == "ENTER":
+        if telegram_text:
+            import time as _t
             plan = {
-                "signal_id": f"{symbol.replace('/', '')}-{int(time.time())}",
-                "timeframe": "1W",
-                "side": decision["side"],
+                "signal_id": f"{symbol.replace('/', '')}-{int(_t.time())}",
+                "timeframe": "1D",
+                "side": side,
                 "strategy": decision.get("strategy") or "GPT-plan",
                 "entries": decision.get("entries") or [],
                 "sl": decision.get("sl"),
                 "tps": decision.get("tps") or [],
-                "leverage": decision.get("leverage"),
-                "eta": decision.get("eta"),
+                "leverage": None,
+                "eta": eta_bars,
             }
 
         return {
             "ok": True,
             "signal_id": plan and plan["signal_id"],
-            "telegram_text": telegram_text,   # chỉ có khi ENTER
-            "analysis_text": analysis_text,   # luôn có
+            "telegram_text": telegram_text,
+            "analysis_text": analysis_text,
             "decision": {
                 "action": decision["decision"],
                 "side": decision["side"],
@@ -286,15 +330,23 @@ def make_telegram_signal(
                 "tps": decision.get("tps"),
                 "reasons": decision.get("reasons"),
                 "trigger_hint": decision.get("trigger_hint"),
-                "leverage": decision.get("leverage"),
-                "eta": decision.get("eta"),
+                "tp1_eta_bars": eta_bars,
             },
-            "plan": plan,   # chỉ khi ENTER
+            "plan": plan,
             "meta": {
                 "confidence": decision.get("confidence"),
-                "eta": decision.get("eta"),
+                "tp1_eta_bars": eta_bars,
             },
         }
 
+
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+def _get_tp1_eta_bars(data: Dict[str, Any]) -> Optional[int]:
+    v = data.get("tp1_eta_bars") or data.get("tp1_eta") or data.get("eta_bars")
+    try:
+        return int(v) if v is not None else None
+    except Exception:
+        return None
