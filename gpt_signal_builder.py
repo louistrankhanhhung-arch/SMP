@@ -24,7 +24,6 @@ client = OpenAI()
 CLASSIFY_SCHEMA = {
     "symbol": "BTC/USDT",
     "decision": "ENTER | WAIT | AVOID",
-    "side": "long | short",
     "confidence": 0.0,
     "strategy": "trend-follow | breakout | retest | reclaim | range | countertrend",
     "entry": [0.0],   # hoặc "entries"
@@ -34,7 +33,6 @@ CLASSIFY_SCHEMA = {
     "tps": [0.0, 0.0],
     "reasons": ["..."],
     "trigger_hint": "nếu WAIT: nêu điều kiện kích hoạt",
-    "leverage": None,
     "eta": None,
 }
 
