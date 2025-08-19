@@ -1,176 +1,314 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Pipeline: vnstock_api -> indicators -> structure_engine -> gpt_signal_builder
-
-- Khung thời gian: 1W (context) & 1D (khung giao dịch; nến 1D có thể đang chạy)
-- Long-only; hiện tại chỉ log ra stdout + file. (Telegram sẽ nối sau)
-- Lịch chạy do cron/systemd hẹn giờ.
-
-ENV gợi ý:
-  - OPENAI_API_KEY: bắt buộc để gọi GPT
-  - SYMBOLS="FPT,SSI,VCB" (tuỳ chọn) hoặc dùng DEFAULT_UNIVERSE trong universe_vn.py
-  - VN_EXCHANGE_MAP='{"FPT":"HOSE","SSI":"HOSE"}' (tuỳ chọn) để định dạng giá theo sàn trong gpt_signal_builder
-
-Run:
-  python main_vn.py --symbols "FPT,SSI" --logfile logs/signal_$(date +%F).log
-"""
+# gpt_signal_builder.py
 import os
-import sys
 import json
-import argparse
-import logging
-from datetime import datetime, timezone
+import time
+from typing import Any, Dict, List, Optional
 
-import pandas as pd
+from openai import OpenAI
 
-from universe_vn import resolve_symbols, get_universe_from_env
-from vnstock_api import fetch_ohlcv
-from indicators import enrich_indicators, enrich_more
-from structure_engine import build_struct_json
-from gpt_signal_builder import make_telegram_signal
-
-# --------------- Logging setup ---------------
-def setup_logging(logfile: str | None):
-    logfmt = "%(asctime)s | %(levelname)s | %(message)s"
-    datefmt = "%Y-%m-%d %H:%M:%S"
-    handlers = [logging.StreamHandler(sys.stdout)]
-    if logfile:
-        os.makedirs(os.path.dirname(logfile), exist_ok=True)
-        handlers.append(logging.FileHandler(logfile, encoding="utf-8"))
-    logging.basicConfig(level=logging.INFO, format=logfmt, datefmt=datefmt, handlers=handlers)
+# ==== Debug helpers (from performance_logger) ====
+# Bật bằng ENV: DEBUG_GPT_INPUT=1 (và tuỳ chọn DEBUG_GPT_DIR)
+try:
+    from performance_logger import debug_dump_gpt_input, debug_print_gpt_input
+except Exception:
+    # fallback no-op nếu chưa có helper (tránh lỗi import khi chạy unit test)
+    def debug_dump_gpt_input(symbol: str, ctx: Dict[str, Any], tag: str = "ctx") -> None: ...
+    def debug_print_gpt_input(ctx: Dict[str, Any]) -> None: ...
 
 
-def _vn_day_progress(now_local_ts) -> float:
+# ====== Config ======
+DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")  # dùng gpt-4o theo yêu cầu
+client = OpenAI()
+
+# ====== Schema output mong đợi từ GPT ======
+CLASSIFY_SCHEMA = {
+    "symbol": "BTC/USDT",
+    "decision": "ENTER | WAIT | AVOID",
+    "side": "long",
+    "confidence": 0.0,
+    "strategy": "trend-follow | breakout | retest | reclaim | range | countertrend",
+    "entry": [0.0],   # hoặc "entries"
+    "entries": [0.0],
+    "sl": 0.0,
+    "tp": [0.0, 0.0],  # hoặc "tps"
+    "tps": [0.0, 0.0],
+    "reasons": ["..."],
+    "trigger_hint": "nếu WAIT: nêu điều kiện kích hoạt",
+    "leverage": None,
+    "eta": None,
+}
+
+
+# ====== Helpers ======
+def _safe(d: Optional[Dict], *keys, default=None):
+    cur = d or {}
+    for k in keys:
+        if cur is None:
+            return default
+        cur = cur.get(k)
+    return default if cur is None else cur
+
+
+def _parse_json_from_text(txt: str) -> Dict[str, Any]:
     """
-    Tính % thời gian giao dịch đã trôi qua trong ngày (VN: 09:00–11:30, 14:00–15:00).
-    Bỏ ATO chi tiết; nếu cần có thể điều chỉnh. Trả về [0.05, 1.0].
+    Cố gắng tách JSON từ nội dung GPT trả về (hỗ trợ có/không code fence).
     """
-    import datetime as dt
-    total_minutes = 150 + 60  # 09:00-11:30 = 150'; 14:00-15:00 = 60'
-    sessions = [(dt.time(9,0), dt.time(11,30)), (dt.time(14,0), dt.time(15,0))]
-    passed = 0
-    t = now_local_ts.time()
+    t = (txt or "").strip()
 
-    # tính phút đã qua trong hai phiên
-    for start, end in sessions:
-        start_dt = dt.datetime.combine(now_local_ts.date(), start, tzinfo=now_local_ts.tzinfo)
-        end_dt   = dt.datetime.combine(now_local_ts.date(), end,   tzinfo=now_local_ts.tzinfo)
-        if t >= end:
-            passed += int((end_dt - start_dt).total_seconds() // 60)
-        elif t > start:
-            now_dt = dt.datetime.combine(now_local_ts.date(), t, tzinfo=now_local_ts.tzinfo)
-            passed += max(0, int((now_dt - start_dt).total_seconds() // 60))
+    # code fence
+    if t.startswith("```"):
+        # loại bỏ fence, cả '```json'
+        t = t.strip().strip("`")
+        if t.lower().startswith("json"):
+            p = t.find("{")
+            if p != -1:
+                t = t[p:]
 
-    prog = passed / total_minutes if total_minutes > 0 else 1.0
-    # chặn đáy 5% để tránh chia cho số rất nhỏ đầu phiên
-    return max(0.05, min(1.0, prog))
-# --------------- Utils ---------------
-def drop_partial_last_bar(df: pd.DataFrame) -> pd.DataFrame:
-    """Bỏ nến cuối nếu còn đang chạy (index > now_utc)."""
-    if df is None or len(df) == 0:
-        return df
-    now_utc = pd.Timestamp.utcnow().tz_localize("UTC")
-    last_ts = df.index[-1]
+    # tìm block {...} lớn nhất
     try:
-        if pd.isna(last_ts.tzinfo):
-            last_ts = last_ts.tz_localize("UTC")
+        start, end = t.find("{"), t.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(t[start:end + 1])
     except Exception:
         pass
-    return df.iloc[:-1] if last_ts > now_utc else df
 
-def load_and_enrich(symbol: str, tf: str, limit: int = 500) -> pd.DataFrame:
-    df = fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-    if tf.upper() == "1H":
-        df = drop_partial_last_bar(df)
-    if df is None or len(df) == 0:
-        return df
-    df = enrich_indicators(df)
-    df = enrich_more(df)
-    return df
-
-# --------------- Core per-symbol ---------------
-def process_symbol(symbol: str) -> dict:
+    # fallback: thử parse trực tiếp
     try:
-        df_w = load_and_enrich(symbol, "1W", limit=400)
-        if df_w is None or len(df_w) == 0:
-            logging.warning(f"{symbol}: Không có dữ liệu 1W.")
-            return {"ok": False, "symbol": symbol, "error": "no_1w"}
+        return json.loads(t)
+    except Exception:
+        return {}
 
-        df_d = load_and_enrich(symbol, "1D", limit=400)
-        if df_d is None or len(df_d) == 0:
-            logging.warning(f"{symbol}: Không có dữ liệu 1D.")
-            return {"ok": False, "symbol": symbol, "error": "no_1d"}
 
-        # ---- compute volume progress for live 1D ----
-        now_local = pd.Timestamp.now(tz="Asia/Ho_Chi_Minh")
-        day_prog = _vn_day_progress(now_local.to_pydatetime())
+def _render_simple_signal(symbol: str, decision: Dict[str, Any]) -> str:
+    """
+    Format Telegram *chỉ dùng khi ENTER*:
+    {Direction} | {Mã}
+    Leverage:
+    Entry:
+    SL:
+    TP:
+    """
+    side = (decision.get("side") or "long").lower()
+    direction = "Long" if side == "long" else "Short"
+    leverage = decision.get("leverage")
+    entries = decision.get("entries") or decision.get("entry") or []
+    tps = decision.get("tps") or decision.get("tp") or []
+    sl = decision.get("sl")
+
+    def _fmt_list(nums):
+        if not nums:
+            return "-"
         try:
-            denom = (df_d['vol_sma20'].iloc[-1] or 0) * day_prog
-            if denom <= 0:
-                vol_progress = None
-            else:
-                vol_progress = float(df_d['volume'].iloc[-1]) / float(denom)
+            return ", ".join(f"{float(x):.6f}" for x in nums)
         except Exception:
-            vol_progress = None
-    
-        # Build struct cho từng TF (context truyền vào TF nhỏ hơn)
-        struct_1w = build_struct_json(symbol, "1W", df_w)  # context top
-        struct_1d = build_struct_json(symbol, "1D", df_d, context_df=df_w)
+            return ", ".join(str(x) for x in nums)
+
+    body = [
+        f"{direction} | {symbol.replace('/', '')}",
+        f"Leverage: {leverage if leverage is not None else '-'}",
+        f"Entry: {_fmt_list(entries)}",
+        f"SL: {('-' if sl is None else (f'{float(sl):.6f}' if isinstance(sl, (int, float, str)) else str(sl)))}",
+        f"TP: {_fmt_list(tps)}",
+    ]
+    return "\n".join(body)
+
+
+def _analysis_text(symbol: str, decision: Dict[str, Any]) -> str:
+    """
+    Text phân tích cho log:
+    - ENTER: list reasons gọn.
+    - WAIT: nêu reasons + trigger_hint.
+    - AVOID: reasons ngắn.
+    """
+    act = (decision.get("decision") or decision.get("action") or "").upper()
+    side = (decision.get("side") or "long").lower()
+    reasons = decision.get("reasons") or []
+    hint = decision.get("trigger_hint")
+
+    # gom bullets 3–8 dòng tối đa
+    bullets = []
+    for r in reasons[:8]:
+        if isinstance(r, str) and r.strip():
+            bullets.append(f"- {r.strip()}")
+
+    if act == "WAIT" and hint:
+        bullets.append(f"- Trigger: {hint}")
+
+    hdr = f"[ĐÁNH GIÁ] {symbol} | {act} | side={side} | conf={decision.get('confidence')}"
+    if bullets:
+        return hdr + "\n" + "\n".join(bullets)
+    return hdr
+
+
+# ====== Prompt xây dựng ======
+
+def build_messages_classify(
+    struct_1w: Dict[str, Any],
+    struct_1d: Dict[str, Any],
+    trigger_1h: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Gửi 2 khung TF: 1W (context), 1D (khung giao dịch; nến 1D có thể đang chạy).
+    Giữ tham số trigger_1h để tương thích, nhưng không sử dụng.
+    """
+    ctx = {
+        "struct_1w": struct_1w,
+        "struct_1d": struct_1d,
+        "struct_1h": (trigger_1h or {}),
+    }
+
+    # === DEBUG: in & ghi JSON đầu vào GPT khi DEBUG_GPT_INPUT=1 ===
+    try:
+        sym_for_dump = (
+            _safe(ctx.get('struct_1w'), 'symbol')
+            or _safe(ctx.get('struct_1d'), 'symbol')
+            or _safe(ctx.get('struct_1h'), 'symbol')
+            or "SYMBOL"
+        )
+        debug_print_gpt_input(ctx)
+        debug_dump_gpt_input(sym_for_dump, ctx, tag="ctx")
+    except Exception:
+        # không để debug làm hỏng flow chính
+        pass
+    content_str = (
+        "Bạn là trader kỹ thuật. Hãy phân loại một mã thành ENTER / WAIT / AVOID "
+        "dựa trên JSON **2 khung: 1W (context) & 1D (khung giao dịch; nến 1D có thể đang chạy)**.\n"
+        "Quy tắc:\n"
+        "- ENTER: 1W–1D đồng pha và có xác nhận (breakout/reclaim/retest) với volume tiến độ ủng hộ; R:R hợp lý theo targets/levels → cung cấp Entry/SL/TP.\n"
+        "- WAIT: xu hướng lớn ủng hộ nhưng thiếu xác nhận ở 1D (nến đang chạy) → chỉ log, kèm trigger_hint (điểm/kịch bản kích hoạt cụ thể).\n"
+        "- AVOID: đi ngược 1D rõ rệt, hoặc R:R xấu/levels tắc/thiếu thanh khoản → log lý do ngắn.\n"
+        "Chấp nhận RSI>70/<30 nếu đi cùng breakout có volume (không loại oan). "
+        "Chỉ tư vấn LONG (không SHORT, không leverage). Tuyệt đối **không được nhắc tới 1H/4H**; "
+        "mọi trigger phải ở 1D (ví dụ: đóng cửa vượt kháng cự, hoặc nến xác nhận với vol_progress ≥ 1.0).\n"
+        "Chỉ trả JSON theo schema sau (tiếng Việt):\n"
+    )
+
+    system = {
+        "role": "system",
+        "content": content_str + json.dumps(CLASSIFY_SCHEMA, ensure_ascii=False),
+    }
+
+
+
+
+    user = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Context JSON (1W & 1D):"},
+            {"type": "text", "text": json.dumps(ctx, ensure_ascii=False)},
+        ],
+    }
+    return [system, user]
+
+
+
+# ====== Hàm chính: trả về telegram_text/analysis_text theo yêu cầu ======
+def make_telegram_signal(struct_1w: Dict[str, Any], struct_1d: Dict[str, Any], trigger_1h: Optional[Dict[str, Any]] = None, ) -> Dict[str, Any]:
+    """
+    - Gọi GPT-4o với 1W & 1D (không dùng 1H).
+    - Nếu ENTER: tạo telegram_text *đơn giản* (Mã, Entry, SL, TP) + analysis_text để log.
+    - Nếu WAIT/AVOID: KHÔNG tạo telegram_text; chỉ trả analysis_text ngắn gọn (WAIT có trigger_hint).
+    """
+    try:
+        msgs = build_messages_classify(struct_1w, struct_1d, trigger_1h=trigger_1h)
+        resp = client.chat.completions.create(
+            model=DEFAULT_MODEL,
+            messages=msgs,
+            temperature=0.0,
+            max_tokens=1800,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        data = _parse_json_from_text(raw)
+
+        if not isinstance(data, dict) or not data:
+            return {"ok": False, "error": "GPT không trả JSON hợp lệ", "raw": raw}
+
+        # Chuẩn hoá fields
+        # ---- Pull ETA (bars/days) for TP1 from struct_1d.long_tp_hint ----
+        tp1_eta_bars_hint = None
+        tp1_eta_days_hint = None
         try:
-            if vol_progress is not None:
-                struct_1d.setdefault('snapshot', {}).setdefault('volume', {})['progress'] = float(vol_progress)
+            tp1_eta_bars_hint = _safe(struct_1d, 'long_tp_hint', 'tp1_eta_bars')
+            tp1_eta_days_hint = _safe(struct_1d, 'long_tp_hint', 'tp1_eta_days')
         except Exception:
             pass
 
-        # Gọi GPT để phân loại/ra setup
-        gpt = make_telegram_signal(struct_1w, struct_1d)
+        symbol = (
+            data.get("symbol")
+            or _safe(struct_1w, "symbol")
+            or _safe(struct_1d, "symbol")
+            or "SYMBOL"
+        )
+        decision_str = (data.get("decision") or data.get("action") or "WAIT").upper()
+        side = (data.get("side") or "long").lower()
 
-        # Logging theo yêu cầu
-        if not gpt.get("ok"):
-            logging.error(f"{symbol}: GPT error: {gpt.get('error')}")
-            return {"ok": False, "symbol": symbol, "error": gpt.get("error")}
+        decision: Dict[str, Any] = {
+            "decision": decision_str,
+            "confidence": data.get("confidence"),
+            "strategy": data.get("strategy"),
+            "entries": data.get("entries") or data.get("entry") or [],
+            "sl": data.get("sl"),
+            "tps": data.get("tps") or data.get("tp") or [],
+            "reasons": data.get("reasons") or (data.get("analysis") and [data["analysis"]] or []),
+            "trigger_hint": data.get("trigger_hint"),
+            "eta": data.get("eta"),
+            "tp1_eta_bars": (data.get("tp1_eta_bars") if isinstance(data, dict) and data.get("tp1_eta_bars") is not None else tp1_eta_bars_hint),
+            "tp1_eta_days": (data.get("tp1_eta_days") if isinstance(data, dict) and data.get("tp1_eta_days") is not None else tp1_eta_days_hint),
+        }
 
-        decision = (gpt.get("decision") or {}).get("action")
-        eta = (gpt.get("decision") or {}).get("tp1_eta_bars")
-        logging.info(f"{symbol}: decision={decision}, tp1_eta_bars={eta}, vol_progress={struct_1d.get('snapshot',{}).get('volume',{}).get('progress')}")
+        # Tạo output theo 3 nhánh
+        telegram_text = None
+        analysis_text = _analysis_text(symbol, decision)
 
-        # always log analysis_text
-        if gpt.get("analysis_text"):
-            for line in str(gpt["analysis_text"]).splitlines():
-                logging.info(f"{symbol} | {line}")
+        if decision_str == "ENTER":
+            telegram_text = _render_simple_signal(symbol, decision)
+        elif decision_str in ("WAIT", "AVOID"):
+            telegram_text = None
+        else:
+            # Bất ngờ/khác → coi như WAIT
+            decision["decision"] = "WAIT"
+            telegram_text = None
 
-        # If GPT đề xuất gửi setup (ENTER hoặc WAIT & ETA<5), telegram_text sẽ có nội dung
-        if gpt.get("telegram_text"):
-            logging.info(f"{symbol} | SETUP:\n{gpt['telegram_text']}")
+        # Gợi ý "plan" tối giản cho dòng post/track
+        plan = None
+        if decision["decision"] == "ENTER":
+            plan = {
+                "signal_id": f"{symbol.replace('/', '')}-{int(time.time())}",
+                "timeframe": "1D",
+                "strategy": decision.get("strategy") or "GPT-plan",
+                "entries": decision.get("entries") or [],
+                "sl": decision.get("sl"),
+                "tps": decision.get("tps") or [],
+                "eta": decision.get("eta"),
+                "tp1_eta_bars": decision.get("tp1_eta_bars"),
+            }
 
-        return {"ok": True, "symbol": symbol, "gpt": gpt}
+        return {
+            "ok": True,
+            "signal_id": plan and plan["signal_id"],
+            "telegram_text": telegram_text,   # chỉ có khi ENTER
+            "analysis_text": analysis_text,   # luôn có
+            "decision": {
+                "action": decision["decision"],
+                "confidence": decision.get("confidence"),
+                "strategy": decision.get("strategy"),
+                "entries": decision.get("entries"),
+                "sl": decision.get("sl"),
+                "tps": decision.get("tps"),
+                "reasons": decision.get("reasons"),
+                "trigger_hint": decision.get("trigger_hint"),
+                "eta": decision.get("eta"),
+                "tp1_eta_bars": decision.get("tp1_eta_bars"),
+            },
+            "plan": plan,   # chỉ khi ENTER
+            "meta": {
+                "confidence": decision.get("confidence"),
+                "eta": decision.get("eta"),
+                "tp1_eta_bars": decision.get("tp1_eta_bars"),
+                "tp1_eta_bars": decision.get("tp1_eta_bars"),
+                "tp1_eta_days": decision.get("tp1_eta_days"),
+            },
+        }
 
     except Exception as e:
-        logging.exception(f"{symbol}: Exception")
-        return {"ok": False, "symbol": symbol, "error": str(e)}
-
-# --------------- CLI ---------------
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--symbols", type=str, default="", help="CSV mã. Nếu bỏ trống dùng env SYMBOLS hoặc DEFAULT_UNIVERSE.")
-    parser.add_argument("--logfile", type=str, default=f"logs/signal_{datetime.now().date()}.log")
-    args = parser.parse_args()
-
-    setup_logging(args.logfile)
-    logging.info("Start VN Signal Pipeline (1W + 1D; live 1D enabled)")
-
-    symbols = resolve_symbols(args.symbols) if args.symbols.strip() else get_universe_from_env()
-    logging.info(f"Symbols: {symbols}")
-
-    results = []
-    for sym in symbols:
-        res = process_symbol(sym)
-        results.append(res)
-
-    ok = sum(1 for r in results if r.get("ok"))
-    fail = len(results) - ok
-    logging.info(f"Done. ok={ok}, fail={fail}")
-
-if __name__ == "__main__":
-    main()
+        return {"ok": False, "error": str(e)}
