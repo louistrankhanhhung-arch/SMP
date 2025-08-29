@@ -1,42 +1,45 @@
+# -*- coding: utf-8 -*-
 """
 vnstock_api.py — Data access layer for Vietnam equities (VN30/HOSE/HNX/UPCoM)
-------------------------------------------------------------------------------
+----------------------------------------------------------------------------
 - Uses unified `vnstock` package (>=3.2.x).
 - Fetch OHLCV for 1D & 1W; includes the *running* candle when include_partial=True.
 - Normalized columns: ["ts","open","high","low","close","volume"]
-- Tries multiple sources if a provider returns empty/error: ["VCI","SSI","MBS","TVSI","HSC"]
+- Tries multiple sources if a provider returns empty/error: ["VCI","TCBS","MSN"]
+- Tries symbol variants: "VCB", "VCB.HOSE", "VCB:HOSE"
+- Tries interval aliases: 1D→["1D","1d","D","day","daily"], 1W→["1W","1w","W","week","weekly"]
 """
 from __future__ import annotations
-from typing import List, Dict
+from typing import List, Dict, Tuple
 import pandas as pd
 import importlib
+from datetime import datetime, timedelta, timezone
 
 _TZ = "Asia/Ho_Chi_Minh"
+_SUPPORTED_SOURCES = ["VCI", "TCBS", "MSN"]
 _INTERVAL_ALIASES = {
     "1D": ["1D", "1d", "D", "day", "daily"],
     "1W": ["1W", "1w", "W", "week", "weekly"],
 }
 
+def _now_vn() -> datetime:
+    # naive local time for VN; we avoid pytz dependency
+    # Asia/Ho_Chi_Minh is UTC+7 without DST
+    return datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(hours=7)
+
 def _check_provider() -> str:
     try:
-        mod = importlib.import_module("vnstock")
-        ver = getattr(mod, "__version__", "0")
-        return str(ver)
+        vnstock = importlib.import_module("vnstock")
+        return getattr(vnstock, "__version__", "unknown")
     except Exception as e:
-        raise RuntimeError("Missing dependency 'vnstock'. Please install: pip install -U vnstock") from e
+        raise RuntimeError(f"vnstock import failed: {e}")
 
-def _now_vn() -> pd.Timestamp:
-    return pd.Timestamp.now(tz=_TZ)
-
-def _infer_start_date(limit: int, timeframe: str) -> str:
-    now = _now_vn()
-    if timeframe.upper() == "1D":
-        start = now - pd.Timedelta(days=int(limit * 1.6))
-    elif timeframe.upper() == "1W":
-        start = now - pd.Timedelta(weeks=int(limit * 1.6))
-    else:
-        raise ValueError("Only 1D and 1W supported")
-    return start.strftime("%Y-%m-%d")
+def _to_date(limit: int) -> Tuple[str, str]:
+    now = _now_vn().date()
+    # buffer 10% to be safe for weekends/holidays
+    days = int(limit * 1.1) + 5
+    start = now - timedelta(days=days)
+    return start.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d")
 
 def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or len(df) == 0:
@@ -52,14 +55,21 @@ def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
     keep = [c for c in ["ts","open","high","low","close","volume"] if c in df.columns]
     df = df[keep].copy()
+    # Normalize timestamp to pandas datetime (naive, VN local)
     if "ts" in df.columns:
-        if not pd.api.types.is_datetime64_any_dtype(df["ts"]):
-            df["ts"] = pd.to_datetime(df["ts"], errors="coerce", utc=True)
-        df["ts"] = df["ts"].dt.tz_convert(_TZ)
+        df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+    # Coerce numerics
     for c in ["open","high","low","close","volume"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.dropna(subset=["ts"]).sort_values("ts").reset_index(drop=True)
+    # Drop rows without ts
+    df = df.dropna(subset=["ts"]).sort_values("ts").reset_index(drop=True)
+    return df
+
+def _symbol_variants(sym: str) -> List[str]:
+    # Some providers accept exchange suffix; we try a few common variants
+    base = sym.strip().upper()
+    return [base, f"{base}.HOSE", f"{base}:HOSE", f"{base}.HSX", f"{base}:HSX"]
 
 def _history_with_fallbacks(obj, start: str, end: str, tf: str):
     """
@@ -90,65 +100,69 @@ def _history_with_fallbacks(obj, start: str, end: str, tf: str):
             continue
     return pd.DataFrame(columns=["ts","open","high","low","close","volume"]), {"tried": tried}
 
+def _drop_running_bar_if_needed(df: pd.DataFrame, timeframe: str, include_partial: bool) -> pd.DataFrame:
+    if include_partial or len(df) == 0:
+        return df
+    # For 1D: drop bar if last ts is "today" VN time (market not closed/committed yet)
+    last_ts = pd.to_datetime(df["ts"].iloc[-1])
+    today_vn = _now_vn().date()
+    if timeframe.upper().startswith("1D") and last_ts.date() >= today_vn:
+        return df.iloc[:-1].copy()
+    return df
+
 def fetch_ohlcv(symbol: str, timeframe: str = "1D", limit: int = 600, include_partial: bool = True) -> pd.DataFrame:
-    """Fetch OHLCV for a single symbol using `vnstock` Quote.history.
-    timeframe in {"1D","1W"}; tries multiple sources if needed.
     """
-    ver = _check_provider()
-    from vnstock import Vnstock, Quote  # type: ignore
-
-    tf = timeframe.upper()
-    if tf not in {"1D","1W"}:
-        raise ValueError("Only 1D and 1W are supported by vnstock_api.fetch_ohlcv")
-
-    start = _infer_start_date(limit=limit, timeframe=tf)
-    end = _now_vn().strftime("%Y-%m-%d")
-
-    sources = ["VCI", "SSI", "MBS", "TVSI", "HSC"]
+    Fetch a single symbol with fallbacks across sources, symbol variants and interval aliases.
+    Returns normalized DataFrame with attrs:
+        - source_used
+        - interval_used
+        - range  ("start-end" | "nodates")
+        - error / source_tried / debug when empty
+    """
+    vnstock = importlib.import_module("vnstock")
+    start, end = _to_date(limit)
+    tf = timeframe
     last_err = None
     df = None
-    used = None
+    used_src = None
     meta_used = {}
-    for src_name in sources:
-        try:
+
+    for src_name in _SUPPORTED_SOURCES:
+        for sym_variant in _symbol_variants(symbol):
             try:
-                quote = Quote(symbol=symbol, source=src_name)
-                df_tmp, meta = _history_with_fallbacks(quote, start, end, tf)
-            except Exception:
-                stock = Vnstock().stock(symbol=symbol, source=src_name)
-                df_tmp, meta = _history_with_fallbacks(stock.quote, start, end, tf)
-            if len(df_tmp) > 0:
-                df = df_tmp
-                used = src_name
-                meta_used = meta
-                break
-        except Exception as e:
-            last_err = str(e)
-            continue
+                # New-style accessor
+                try:
+                    quote = vnstock.Quote(symbol=sym_variant, source=src_name)
+                    df_tmp, meta = _history_with_fallbacks(quote, start, end, tf)
+                except Exception:
+                    # Legacy path
+                    stk = vnstock.Vnstock().stock(symbol=sym_variant, source=src_name)
+                    df_tmp, meta = _history_with_fallbacks(stk.quote, start, end, tf)
+                if len(df_tmp) > 0:
+                    df = df_tmp
+                    used_src = src_name
+                    meta_used = meta
+                    break
+            except Exception as e:
+                last_err = str(e)
+                continue
+        if df is not None and len(df) > 0:
+            break
 
     if df is None:
         df = pd.DataFrame(columns=["ts","open","high","low","close","volume"])
         if last_err:
             df.attrs["error"] = last_err
-        df.attrs["source_tried"] = ",".join(sources)
+        df.attrs["source_tried"] = ",".join(_SUPPORTED_SOURCES)
         df.attrs["debug"] = "no_rows_after_all_fallbacks"
         return df
 
-    if not include_partial and len(df) > 0:
-        last = df.iloc[-1]["ts"]
-        if tf == "1D":
-            is_incomplete = last.date() == _now_vn().date()
-        else:
-            now = _now_vn()
-            is_incomplete = (last.isocalendar().week == now.isocalendar().week) and (last.year == now.year)
-        if is_incomplete:
-            df = df.iloc[:-1].copy()
+    # Optionally drop the running bar
+    df = _drop_running_bar_if_needed(df, timeframe, include_partial)
 
-    if limit and len(df) > limit:
-        df = df.iloc[-limit:].reset_index(drop=True)
-
-    if used:
-        df.attrs["source_used"] = used
+    # Attach metadata
+    if used_src:
+        df.attrs["source_used"] = used_src
     if meta_used:
         for k, v in meta_used.items():
             df.attrs[k] = v
@@ -157,35 +171,16 @@ def fetch_ohlcv(symbol: str, timeframe: str = "1D", limit: int = 600, include_pa
 def fetch_ohlcv_batch(symbols: List[str], timeframe: str = "1D", limit: int = 600, include_partial: bool = True) -> Dict[str, pd.DataFrame]:
     out: Dict[str, pd.DataFrame] = {}
     for sym in symbols:
-        try:
-            out[sym] = fetch_ohlcv(sym, timeframe=timeframe, limit=limit, include_partial=include_partial)
-        except Exception as e:
-            df = pd.DataFrame(columns=["ts","open","high","low","close","volume"])
-            df.attrs["error"] = str(e)
-            out[sym] = df
+        out[sym] = fetch_ohlcv(sym, timeframe=timeframe, limit=limit, include_partial=include_partial)
     return out
 
-def latest_bar(symbol: str, timeframe: str = "1D", include_partial: bool = True):
-    df = fetch_ohlcv(symbol, timeframe=timeframe, limit=2, include_partial=include_partial)
-    if len(df) == 0:
-        return None
-    row = df.iloc[-1]
-    return {
-        "symbol": symbol,
-        "timeframe": timeframe.upper(),
-        "ts": row["ts"],
-        "open": float(row["open"]),
-        "high": float(row["high"]),
-        "low": float(row["low"]),
-        "close": float(row["close"]),
-        "volume": float(row["volume"]) if not pd.isna(row["volume"]) else None,
-    }
-
+# Self-test
 if __name__ == "__main__":
     try:
         print("vnstock version:", _check_provider())
-        test_df = fetch_ohlcv("VCB", timeframe="1D", limit=100, include_partial=True)
-        print("Fetched rows:", len(test_df), "| source_used:", test_df.attrs.get("source_used"))
+        test_df = fetch_ohlcv("VCB", timeframe="1D", limit=160, include_partial=True)
+        print("Fetched rows:", len(test_df), "| source_used:", test_df.attrs.get("source_used"),
+              "| interval:", test_df.attrs.get("interval_used"), "| range:", test_df.attrs.get("range"))
         print(test_df.tail())
     except Exception as e:
         print("Self-test failed:", e)
