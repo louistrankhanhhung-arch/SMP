@@ -13,7 +13,20 @@ def _to_num(s):
     return pd.to_numeric(s, errors="coerce")
 
 def _safe_div(a, b):
-    return np.where(b == 0, np.nan, a / b)
+    """Elementwise safe division that preserves pandas Series type when possible."""
+    a = pd.to_numeric(a, errors="coerce") if not isinstance(a, pd.Series) else pd.to_numeric(a, errors="coerce")
+    b = pd.to_numeric(b, errors="coerce") if not isinstance(b, pd.Series) else pd.to_numeric(b, errors="coerce")
+    try:
+        res = a.divide(b)
+        # Replace inf/-inf where b == 0
+        if isinstance(res, pd.Series):
+            res = res.replace([np.inf, -np.inf], np.nan)
+        return res
+    except Exception:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            res = np.divide(a, b)
+        res = np.where(np.isfinite(res), res, np.nan)
+        return res
 
 def _ensure_sorted(df: pd.DataFrame) -> pd.DataFrame:
     if "ts" in df.columns:
@@ -123,8 +136,11 @@ def cum_vwap(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Serie
 def candle_anatomy(open_, high, low, close):
     o, h, l, c = _to_num(open_), _to_num(high), _to_num(low), _to_num(close)
     body = (c - o).abs()
-    upper_wick = h - np.maximum(c, o)
-    lower_wick = np.minimum(c, o) - l
+    # elementwise max/min that preserve Series (avoid numpy.ndarray which lacks .rolling)
+    co_max = pd.concat([c, o], axis=1).max(axis=1)
+    co_min = pd.concat([c, o], axis=1).min(axis=1)
+    upper_wick = h - co_max
+    lower_wick = co_min - l
     range_ = h - l
     body_pct = _safe_div(body, range_)
     return body, upper_wick, lower_wick, range_, body_pct
