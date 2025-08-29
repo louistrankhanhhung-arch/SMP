@@ -155,7 +155,11 @@ def enrich_indicators(df: pd.DataFrame, *, ema_fast: int = 20, ema_slow: int = 5
     h = _to_num(out.get("high"))
     l = _to_num(out.get("low"))
     c = _to_num(out.get("close"))
+    # Một số nguồn (nhất là 1W) có thể thiếu volume → đảm bảo cột tồn tại để tránh exception
+    if "volume" not in out.columns:
+        out["volume"] = np.nan
     v = _to_num(out.get("volume"))
+    out["volume"] = v
 
     # MAs
     out["ema20"] = ema(c, ema_fast)
