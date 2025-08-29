@@ -32,7 +32,6 @@ import pandas as pd
 from universe import get_universe_from_env
 from vnstock_api import fetch_ohlcv_batch, fetch_ohlcv
 from feature_primitives import compute_features_by_tf
-from evidence_evaluators import evaluate
 from decision_engine import decide
 
 VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
@@ -122,8 +121,8 @@ def scan_symbols(symbols: List[str]) -> None:
                 log_info(f"[{sym}] DECISION=WAIT | reason=insufficient_1D_bars({len(df1d) if df1d is not None else 0})")
                 continue
             feats = compute_features_by_tf({"1D": df1d, "1W": df1w})
-            ev = evaluate(feats)
-            plan = decide(features_by_tf, ev, cfg=cfg, sym=sym)
+            ev = None  # để decision_engine tự gọi _safe_eval
+            plan = decide(feats, ev, cfg=cfg, sym=sym)
             log_info(format_plan(sym, plan))
             time.sleep(0.1)  # tiny pacing within block
         except Exception as e:
