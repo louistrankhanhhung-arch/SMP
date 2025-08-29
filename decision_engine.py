@@ -65,6 +65,21 @@ except Exception:
         _logger.error(msg)
 # --- end shim ---
 
+def _safe_eval(features_all):
+    if _evaluate is None:
+        return None
+    try:
+        # TH1: evaluator nhận keyword 'features_by_tf'
+        return _evaluate(features_by_tf=features_all)
+    except TypeError:
+        # TH2: evaluator chỉ nhận 1 positional
+        try:
+            return _evaluate(features_all)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
 # =========================
 # Default configuration
 # =========================
@@ -176,11 +191,8 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
     f1d = d1.get("features", {}) or {}
     # Compute evidence if not provided
     ev = evidence
-    if ev is None and _evaluate is not None:
-        try:
-            ev = _evaluate(features_by_tf)
-        except Exception:
-            ev = None
+    if ev is None:
+    ev = _safe_eval(features_by_tf)  # dùng helper, không để lỗi bắn ra ngoài
 
     # Build single unified 'out' (không ghi đè lần 2)
     ev_state = ev.get("state") if isinstance(ev, dict) else None
