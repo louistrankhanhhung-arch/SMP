@@ -12,6 +12,10 @@ import pandas as pd
 import importlib
 
 _TZ = "Asia/Ho_Chi_Minh"
+_INTERVAL_ALIASES = {
+    "1D": ["1D", "1d", "D", "day", "daily"],
+    "1W": ["1W", "1w", "W", "week", "weekly"],
+}
 
 def _check_provider() -> str:
     try:
@@ -57,6 +61,35 @@ def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df.dropna(subset=["ts"]).sort_values("ts").reset_index(drop=True)
 
+def _history_with_fallbacks(obj, start: str, end: str, tf: str):
+    """
+    Try multiple interval aliases; if still empty, try again without date range.
+    Returns (df, meta) where meta describes provider/interval used.
+    """
+    tried = []
+    for itv in _INTERVAL_ALIASES.get(tf, [tf]):
+        try:
+            raw = obj.history(start=start, end=end, interval=itv)
+            tried.append(itv)
+            df_tmp = _normalize_df(raw)
+            if len(df_tmp) > 0:
+                return df_tmp, {"interval_used": itv, "range": "start-end"}
+        except Exception as e:
+            tried.append(f"{itv}:err={e}")
+            continue
+    # try without dates (provider default range)
+    for itv in _INTERVAL_ALIASES.get(tf, [tf]):
+        try:
+            raw = obj.history(interval=itv)
+            tried.append(f"{itv}(nodates)")
+            df_tmp = _normalize_df(raw)
+            if len(df_tmp) > 0:
+                return df_tmp, {"interval_used": itv, "range": "nodates"}
+        except Exception as e:
+            tried.append(f"{itv}(nodates):err={e}")
+            continue
+    return pd.DataFrame(columns=["ts","open","high","low","close","volume"]), {"tried": tried}
+
 def fetch_ohlcv(symbol: str, timeframe: str = "1D", limit: int = 600, include_partial: bool = True) -> pd.DataFrame:
     """Fetch OHLCV for a single symbol using `vnstock` Quote.history.
     timeframe in {"1D","1W"}; tries multiple sources if needed.
@@ -75,18 +108,19 @@ def fetch_ohlcv(symbol: str, timeframe: str = "1D", limit: int = 600, include_pa
     last_err = None
     df = None
     used = None
+    meta_used = {}
     for src_name in sources:
         try:
             try:
                 quote = Quote(symbol=symbol, source=src_name)
-                raw = quote.history(start=start, end=end, interval=tf)
+                df_tmp, meta = _history_with_fallbacks(quote, start, end, tf)
             except Exception:
                 stock = Vnstock().stock(symbol=symbol, source=src_name)
-                raw = stock.quote.history(start=start, end=end, interval=tf)
-            df_tmp = _normalize_df(raw)
+                df_tmp, meta = _history_with_fallbacks(stock.quote, start, end, tf)
             if len(df_tmp) > 0:
                 df = df_tmp
                 used = src_name
+                meta_used = meta
                 break
         except Exception as e:
             last_err = str(e)
@@ -97,6 +131,7 @@ def fetch_ohlcv(symbol: str, timeframe: str = "1D", limit: int = 600, include_pa
         if last_err:
             df.attrs["error"] = last_err
         df.attrs["source_tried"] = ",".join(sources)
+        df.attrs["debug"] = "no_rows_after_all_fallbacks"
         return df
 
     if not include_partial and len(df) > 0:
@@ -114,6 +149,9 @@ def fetch_ohlcv(symbol: str, timeframe: str = "1D", limit: int = 600, include_pa
 
     if used:
         df.attrs["source_used"] = used
+    if meta_used:
+        for k, v in meta_used.items():
+            df.attrs[k] = v
     return df
 
 def fetch_ohlcv_batch(symbols: List[str], timeframe: str = "1D", limit: int = 600, include_partial: bool = True) -> Dict[str, pd.DataFrame]:
