@@ -166,7 +166,13 @@ def enrich_and_features(df: pd.DataFrame, timeframe: str) -> dict:
         return {'timeframe': timeframe, 'df': df, 'features': {}}
     e = enrich_indicators(df)
     feats = _derive_features(e, timeframe=timeframe)
-    return {'timeframe': timeframe, 'df': e, 'features': feats}
+    out = {'timeframe': timeframe, 'df': e, 'features': feats}
+    try:
+        if ("volume" not in e.columns) or (getattr(e["volume"], "isna", lambda: None)().all()):
+            out["warnings"] = ["no_volume"]
+    except Exception:
+        pass
+    return out
 
 def compute_features_by_tf(dfs_by_tf: Dict[str, pd.DataFrame]) -> Dict[str, dict]:
     """Compute features for each timeframe dict entry (e.g., {'1D': df1d, '1W': df1w})."""
