@@ -122,7 +122,7 @@ def scan_symbols(symbols: List[str]) -> None:
                 continue
             feats = compute_features_by_tf({"1D": df1d, "1W": df1w})
             ev = None  # để decision_engine tự gọi _safe_eval
-            plan = decide(feats, ev, cfg=cfg, sym=sym)
+            plan = decide(feats, ev, sym=sym)
             log_info(format_plan(sym, plan))
             time.sleep(0.1)  # tiny pacing within block
         except Exception as e:
