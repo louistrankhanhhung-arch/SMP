@@ -110,16 +110,16 @@ def _pct(a, b) -> float:
 def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
-def _pick_base_sl(f1d: dict) -> float:
-    # Base = min(ema_pref, lo20, lo50)
-    ema_pref = f1d.get(DEFAULT_CFG["ema_sl_pref"], np.nan)
+def _pick_base_sl(f1d: dict, ema_pref_key: str) -> float:
+    # Base = min(ema_pref, lo20, lo50) — honor runtime cfg
+    ema_pref = f1d.get(ema_pref_key, np.nan)
     lo20 = _get(f1d, "lo20", np.nan)
     lo50 = _get(f1d, "lo50", np.nan)
     candidates = [x for x in [ema_pref, lo20, lo50] if not np.isnan(x)]
     return float(min(candidates)) if candidates else float("nan")
 
-def _compute_sl(entry: float, f1d: dict, *, atr_mult: float, sl_min_pct: float, sl_max_pct: float) -> float:
-    base = _pick_base_sl(f1d)
+def _compute_sl(entry: float, f1d: dict, *, atr_mult: float, sl_min_pct: float, sl_max_pct: float, ema_pref_key: str) -> float:
+    base = _pick_base_sl(f1d, ema_pref_key)
     atr = _get(f1d, "atr14", np.nan)
     sl = base if not np.isnan(base) else (entry - 2.0 * (entry * sl_min_pct / 100.0))
     if not np.isnan(atr):
@@ -174,12 +174,6 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
     d1 = features_by_tf.get(cfg["primary_tf"], {})
     df1d = d1.get("df", None)
     f1d = d1.get("features", {}) or {}
-    out = {
-        "symbol": sym,
-        "state": (evidence or {}).get("state"),
-        "dir":   (evidence or {}).get("dir"),
-        "missing": []
-    }
     # Compute evidence if not provided
     ev = evidence
     if ev is None and _evaluate is not None:
@@ -188,17 +182,23 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
         except Exception:
             ev = None
 
+    # Build single unified 'out' (không ghi đè lần 2)
+    ev_state = ev.get("state") if isinstance(ev, dict) else None
+    ev_dir   = ev.get("direction") if isinstance(ev, dict) else None
     out: Dict[str, Any] = {
+        "symbol": sym,
         "timeframe_primary": cfg["primary_tf"],
-        "STATE": ev.get("state") if isinstance(ev, dict) else None,
-        "DIRECTION": "LONG",  # LONG-only engine
+        "STATE": ev_state,                  # UPPER for plan view
+        "DIRECTION": "LONG",                # LONG-only engine
+        "state": ev_state,                  # lower for legacy logs
+        "dir":   ev_dir,                    # evaluator’s bias if any
         "DECISION": "WAIT",
         "entry": None, "entry2": None, "sl": None,
         "tp1": None, "tp2": None, "tp3": None, "tp4": None, "tp5": None,
         "rr": None, "rr2": None,
         "missing": [],
-        "notes": ev.get("notes", []) if isinstance(ev, dict) else [],
-        "confirmations": ev.get("confirmations", {}) if isinstance(ev, dict) else {},
+        "notes": (ev.get("notes") if isinstance(ev, dict) else []) or [],
+        "confirmations": (ev.get("confirmations") if isinstance(ev, dict) else {}) or {},
     }
 
     # Quickly filter: if evaluator says SHORT strongly, we still keep LONG-only;
@@ -210,22 +210,24 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
     # 1) Không có feature 1D -> thiếu dữ liệu
     if not f1d:
         out["missing"].append("missing_features")
-        V_ok = bool((evidence or {}).get("volume_ok", False))
-        M_ok = bool((evidence or {}).get("momentum_ok", False))
-        C_ok = bool((evidence or {}).get("candle_ok", False))
+        _conf = out["confirmations"]
+        V_ok = bool(_conf.get("volume", False))
+        M_ok = bool(_conf.get("momentum", False))
+        C_ok = bool(_conf.get("candles", False))
         out["confirm"] = {"V": V_ok, "M": M_ok, "C": C_ok}
-        log_info(f"[{out['symbol']}] DECISION=WAIT | STATE={out.get('state')} | DIR={out.get('dir')} | "
+        log_info(f"[{out['symbol']}] DECISION=WAIT | STATE={out.get('STATE')} | DIR={out.get('DIRECTION')} | "
                  f"reason=missing_features | confirm:V={V_ok} M={M_ok} C={C_ok} | missing={list(out['missing'])}")
         return out
 
     # 2) Có feature: cho _should_enter_long tự append các khóa thiếu vào out["missing"]
-    can_enter = _should_enter_long(evidence or {}, f1d, cfg or {}, out["missing"])
+    can_enter = _should_enter_long((ev or {}), f1d, cfg or {}, out["missing"])
     if not can_enter:
-        V_ok = bool((evidence or {}).get("volume_ok", False))
-        M_ok = bool((evidence or {}).get("momentum_ok", False))
-        C_ok = bool((evidence or {}).get("candle_ok", False))
+        _conf = out["confirmations"]
+        V_ok = bool(_conf.get("volume", False))
+        M_ok = bool(_conf.get("momentum", False))
+        C_ok = bool(_conf.get("candles", False))
         out["confirm"] = {"V": V_ok, "M": M_ok, "C": C_ok}
-        log_info(f"[{out['symbol']}] DECISION=WAIT | STATE={out.get('state')} | DIR={out.get('dir')} | "
+        log_info(f"[{out['symbol']}] DECISION=WAIT | STATE={out.get('STATE')} | DIR={out.get('DIRECTION')} | "
                  f"reason=missing_features | confirm:V={V_ok} M={M_ok} C={C_ok} | missing={list(out['missing'])}")
         return out
 
@@ -237,7 +239,13 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
         return out
 
     entry = price  # simple market entry at scan
-    sl = _compute_sl(entry, f1d, atr_mult=cfg["atr_sl_mult"], sl_min_pct=cfg["sl_min_pct"], sl_max_pct=cfg["sl_max_pct"])
+    sl = _compute_sl(
+        entry, f1d,
+        atr_mult=cfg["atr_sl_mult"],
+        sl_min_pct=cfg["sl_min_pct"],
+        sl_max_pct=cfg["sl_max_pct"],
+        ema_pref_key=cfg["ema_sl_pref"],
+    )
     if sl >= entry:  # safety
         sl = entry * (1.0 - cfg["sl_min_pct"]/100.0)
 
