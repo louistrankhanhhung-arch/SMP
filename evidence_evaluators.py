@@ -46,7 +46,15 @@ DEFAULT_CFG = {
     'near_ema_pct': 1.5,       # pullback to ema20/50 threshold
     'near_sr_pct': 1.0,        # pivot/SR proximity
     'breakout_buffer_pct': 0.5,# must clear hi20 by this percent
-    'breakdown_buffer_pct': 0.5,
+    # --- New: ngưỡng chuyên biệt theo state
+    'rsi_breakout_min': 60.0,
+    'bb_pctb_breakout_min': 0.80,
+    'vol_ratio_ok_breakout': 1.30,   # >=1.3x MA20 vol
+    'vol_z_ok_breakout': 1.00,
+    'dry_up_ratio_max': 0.80,        # pullback/reclaim: vol <=0.8x MA20 ở nhịp giảm
+    'candle_body_min': 0.35,         # thân nến tối thiểu (tỷ lệ range)
+    'tail_ratio_min': 0.60,          # pin/hammer tail ratio
+    'pullback_mid_bb_dist_max_pct': 1.0,  # khoảng cách tối đa tới mid-BB (%)
     'meanrevert_band_edge': 0.10, # bb_pctb < 0.10 (lower) or > 0.90 (upper)
     'atr_push_min': 0.6,       # range >= 0.6 * ATR for meaningful candle
     # Volume / momentum / candles validators
@@ -118,12 +126,25 @@ def _or_validation(df1d: pd.DataFrame, f1d: dict, prev1d: dict | None, cfg: dict
 # =========================
 def _breakout(df1d: pd.DataFrame, f1d: dict, cfg: dict) -> Tuple[float, str]:
     close = _get(f1d, 'close')
-    hi20 = _get(f1d, 'hi20')
+    hi20  = _get(f1d, 'hi20')
+    rsi   = _get(f1d, 'rsi14', np.nan)
+    pctb  = _get(f1d, 'bb_pctb', np.nan)
+    vr    = _get(f1d, 'vol_ratio', np.nan)
+    vz    = _get(f1d, 'vol_z', np.nan)
     stacked_bull = bool(_get(f1d, 'stacked_bull', False))
     dist = _pct_dist(close, hi20)
-    pass_cond = (not np.isnan(dist)) and (dist >= cfg['breakout_buffer_pct']) and stacked_bull
-    score = 0.0 if not pass_cond else min(1.0, 0.5 + dist/3.0)  # grows with clearance
-    note = f"close>{cfg['breakout_buffer_pct']}% above hi20 & stacked_bull" if pass_cond else "n/a"
+    cond_base = (not np.isnan(dist)) and (dist >= cfg['breakout_buffer_pct']) and stacked_bull
+    rsi_ok = (not np.isnan(rsi)) and (rsi >= cfg['rsi_breakout_min'])
+    bb_ok  = (not np.isnan(pctb)) and (pctb >= cfg['bb_pctb_breakout_min'])
+    vol_ok = ( (not np.isnan(vr) and vr >= cfg['vol_ratio_ok_breakout']) or
+               (not np.isnan(vz) and vz >= cfg['vol_z_ok_breakout']) )
+    pass_cond = bool(cond_base and rsi_ok and bb_ok)
+    if not pass_cond:
+        return 0.0, "n/a"
+    # Score ưu tiên có volume; nếu thiếu volume sẽ để decision_engine gate thêm (Momentum & Candles)
+    base = min(1.0, 0.5 + dist/3.0)
+    score = float(min(1.0, base + (0.10 if vol_ok else 0.0)))
+    note = f"breakout: dist={dist:.2f}% rsi_ok={rsi_ok} bb_ok={bb_ok} vol_ok={vol_ok}"
     return score, note
 
 def _breakdown(df1d: pd.DataFrame, f1d: dict, cfg: dict) -> Tuple[float, str]:
@@ -137,13 +158,24 @@ def _breakdown(df1d: pd.DataFrame, f1d: dict, cfg: dict) -> Tuple[float, str]:
     return score, note
 
 def _reclaim(df1d: pd.DataFrame, f1d: dict, prev1d: dict | None, cfg: dict) -> Tuple[float, str]:
-    # Price was below pivot/ema20 and now above (bullish reclaim). Opposite is 'reject' (bearish).
+    # Bullish reclaim: dưới EMA20/pivot → nay đóng trên; yêu cầu dry-up→push + candle đảo chiều + RSI filter
     close = _get(f1d, 'close'); prev_close = _get(prev1d, 'close', np.nan) if prev1d else np.nan
     ema20 = _get(f1d, 'ema20'); prev_ema20 = _get(prev1d, 'ema20', np.nan) if prev1d else np.nan
     pivot = _get(f1d, 'pivot'); prev_pivot = _get(prev1d, 'pivot', np.nan) if prev1d else np.nan
-    cond = (not np.isnan(prev_close) and not np.isnan(prev_ema20) and prev_close < prev_ema20 and close > ema20) or                (not np.isnan(prev_close) and not np.isnan(prev_pivot) and prev_close < prev_pivot and close > pivot)
+    rsi   = _get(f1d, 'rsi14', np.nan)
+    vr    = _get(f1d, 'vol_ratio', np.nan); vr_prev = _get(prev1d, 'vol_ratio', np.nan)
+    body  = _get(f1d, 'body_pct', np.nan); tail = _get(f1d, 'lower_tail_ratio', np.nan)
+    base = (not np.isnan(prev_close) and not np.isnan(prev_ema20) and not np.isnan(prev_pivot)
+            and (prev_close < prev_ema20 or prev_close < prev_pivot)
+            and (close > ema20 or close > pivot))
+    rsi_ok = (not np.isnan(rsi)) and (rsi >= 55)
+    dry_up_prev = (not np.isnan(vr_prev)) and (vr_prev <= cfg['dry_up_ratio_max'])
+    push_now = (not np.isnan(vr)) and (vr >= 1.0)
+    candle_ok = ((not np.isnan(body) and body >= cfg['candle_body_min']) or
+                 (not np.isnan(tail) and tail >= cfg['tail_ratio_min']))
+    cond = bool(base and rsi_ok and (push_now or candle_ok) and dry_up_prev)
     score = 0.65 if cond else 0.0
-    note = "bullish reclaim over ema20/pivot" if cond else "n/a"
+    note = "reclaim: base&dryup&push/candle&rsi" if cond else "n/a"
     return score, note
 
 def _reject(df1d: pd.DataFrame, f1d: dict, prev1d: dict | None, cfg: dict) -> Tuple[float, str]:
@@ -157,16 +189,29 @@ def _reject(df1d: pd.DataFrame, f1d: dict, prev1d: dict | None, cfg: dict) -> Tu
 
 def _pullback_to_ema(df1d: pd.DataFrame, f1d: dict, cfg: dict) -> Tuple[float, str]:
     close = _get(f1d, 'close')
-    ema20 = _get(f1d, 'ema20')
-    ema50 = _get(f1d, 'ema50')
+    ema20 = _get(f1d, 'ema20'); ema50 = _get(f1d, 'ema50')
+    bb_mid = _get(f1d, 'bb_mid', np.nan)
+    rsi = _get(f1d, 'rsi14', np.nan)
+    vr_prev = np.nan
+    if isinstance(df1d, pd.DataFrame) and len(df1d) >= 2:
+        # lấy vol_ratio phiên trước từ features_by_tf (đã build ở evaluate) nếu có
+        try:
+            prev_row = df1d.iloc[-2]
+            vr_prev = float(prev_row.get('vol_ratio', np.nan))
+        except Exception:
+            pass
+    body  = _get(f1d, 'body_pct', np.nan); tail = _get(f1d, 'lower_tail_ratio', np.nan)
     stacked_bull = bool(_get(f1d, 'stacked_bull', False))
-    stacked_bear = bool(_get(f1d, 'stacked_bear', False))
     d20 = abs(_pct_dist(close, ema20)); d50 = abs(_pct_dist(close, ema50))
-    # Long in bull trend if close ~ ema20 or ema50; Short in bear symmetric (handled at combine stage)
-    near = (not np.isnan(d20) and d20 <= cfg['near_ema_pct']) or (not np.isnan(d50) and d50 <= cfg['near_ema_pct'])
-    ok = near and (stacked_bull or stacked_bear)
+    near_ema = (not np.isnan(d20) and d20 <= cfg['near_ema_pct']) or (not np.isnan(d50) and d50 <= cfg['near_ema_pct'])
+    near_mid = (not np.isnan(bb_mid) and abs(_pct_dist(close, bb_mid)) <= cfg['pullback_mid_bb_dist_max_pct'])
+    rsi_ok = (not np.isnan(rsi)) and (rsi >= 50)
+    dry_up_prev = (not np.isnan(vr_prev)) and (vr_prev <= cfg['dry_up_ratio_max'])
+    candle_ok = ((not np.isnan(body) and body >= cfg['candle_body_min']) or
+                 (not np.isnan(tail) and tail >= cfg['tail_ratio_min']))
+    ok = bool(stacked_bull and rsi_ok and (near_ema or near_mid) and dry_up_prev and candle_ok)
     score = 0.55 if ok else 0.0
-    note = "pullback near ema20/50 within trend" if ok else "n/a"
+    note = "pullback: near EMA/mid-BB + dry-up prev + candle + RSI" if ok else "n/a"
     return score, note
 
 def _mean_revert(df1d: pd.DataFrame, f1d: dict, cfg: dict) -> Tuple[float, str]:
@@ -182,6 +227,21 @@ def _squeeze_expansion(df1d: pd.DataFrame, f1d: dict, prev1d: dict | None, cfg: 
     expanding = (not np.isnan(bw) and not np.isnan(bw_prev)) and ((bw - bw_prev) >= cfg['bb_width_expand'])
     score = 0.45 if (low and expanding) else (0.25 if expanding else 0.0)
     note = "squeeze expanding" if (low or expanding) else "n/a"
+    # Yêu cầu bung nén có "push" thật: ATR push + break high gần nhất; khuyến nghị kèm volume
+    bb_w = _get(f1d, 'bb_width', np.nan)
+    bb_w_prev = _get(prev1d, 'bb_width', np.nan) if prev1d else np.nan
+    atr14 = _get(f1d, 'atr14', np.nan)
+    row = df1d.iloc[-1] if isinstance(df1d, pd.DataFrame) and len(df1d) else None
+    prev_row = df1d.iloc[-2] if isinstance(df1d, pd.DataFrame) and len(df1d) >= 2 else None
+    rng = float(row['range']) if row is not None else np.nan
+    close = float(row['close']) if row is not None else np.nan
+    prev_high = float(prev_row['high']) if prev_row is not None else np.nan
+    push = (not np.isnan(atr14) and not np.isnan(rng) and rng >= 0.8 * atr14)
+    break_high = (not np.isnan(close) and not np.isnan(prev_high) and close > prev_high)
+    expanding = (not np.isnan(bb_w) and not np.isnan(bb_w_prev) and bb_w > bb_w_prev)
+    ok = bool(expanding and push and break_high)
+    score = 0.60 if ok else 0.0
+    note = "squeeze_expansion: expanding + ATR push + close>high[-1]" if ok else "n/a"
     return score, note
 
 # =========================
