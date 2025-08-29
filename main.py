@@ -30,7 +30,7 @@ import pandas as pd
 
 # Local modules
 from universe import get_universe_from_env
-from vnstock_api import fetch_ohlcv_batch
+from vnstock_api import fetch_ohlcv_batch, fetch_ohlcv
 from feature_primitives import compute_features_by_tf
 from evidence_evaluators import evaluate
 from decision_engine import decide
@@ -105,6 +105,19 @@ def scan_symbols(symbols: List[str]) -> None:
             df1w = data_1w.get(sym, None)
             if df1w is None:
                 df1w = pd.DataFrame()
+            # Rescue refetch if 1D empty
+            if df1d is None or len(df1d) == 0:
+                # log debug info from attrs if any
+                src_tried = getattr(df1d, "attrs", {}).get("source_tried")
+                err = getattr(df1d, "attrs", {}).get("error")
+                dbg = getattr(df1d, "attrs", {}).get("debug")
+                if src_tried or err or dbg:
+                    log_info(f"[{sym}] 1D empty | debug={dbg} | source_tried={src_tried} | error={err}")
+                # Try smaller limit & no date cut
+                df1d = fetch_ohlcv(sym, timeframe="1D", limit=120, include_partial=True)
+                if len(df1d) == 0:
+                    # Try exclude running bar (some providers only commit after close)
+                    df1d = fetch_ohlcv(sym, timeframe="1D", limit=120, include_partial=False)
             if df1d is None or len(df1d) < 30:
                 log_info(f"[{sym}] DECISION=WAIT | reason=insufficient_1D_bars({len(df1d) if df1d is not None else 0})")
                 continue
