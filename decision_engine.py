@@ -104,6 +104,9 @@ DEFAULT_CFG = {
     },
     # Minimum confidence required to ENTER
     "min_conf_enter": 0.55,
+    # --- New: ngưỡng gating bổ sung (đồng bộ với evidence_evaluators)
+    "rsi_breakout_min": 60.0,
+    "bb_pctb_breakout_min": 0.80,
     # Require validator OR-gate to pass (volume or momentum/candles)
     "require_validation": True,
     # --- Fallback for early bullish reversal when evaluator returns None/bearish
@@ -268,14 +271,32 @@ def _should_enter_long(ev: dict, f1d: dict, cfg: dict, missing: List[str]) -> bo
         missing.append("bearish_or_none_state")
         return False
     if cfg.get("require_validation", True):
-        val = ev.get("confirmations", {})
-        if not any(val.values()):
-            missing.append("validators_not_ok (need Volume OR Momentum/Candles)")
+        val = ev.get("confirmations", {}) or {}
+        st  = (ev.get("state") or "").lower()
+        # Mặc định: Volume OR Momentum OR Candles
+        gate_ok = bool(any(val.values()))
+        # Siết riêng cho breakout: Volume OR (Momentum AND Candles)
+        if st == "breakout":
+            gate_ok = bool(val.get("volume") or (val.get("momentum") and val.get("candles")))
+            if not gate_ok:
+                missing.append("breakout_requires_volume OR (momentum AND candles)")
+        if not gate_ok:
+            missing.append("validators_not_ok")
             return False
     conf = float(ev.get("confidence", 0.0))
     if conf < cfg["min_conf_enter"]:
         missing.append(f"low_confidence<{cfg['min_conf_enter']}")
         return False
+    # Thêm filter nhỏ cho breakout: RSI & vị trí trên BB
+    if (ev.get("state") or "").lower() == "breakout":
+        rsi = float(_get(f1d, "rsi14", float("nan")))
+        pctb = float(_get(f1d, "bb_pctb", float("nan")))
+        if (not np.isnan(rsi)) and rsi < cfg["rsi_breakout_min"]:
+            missing.append("rsi_breakout_min")
+            return False
+        if (not np.isnan(pctb)) and pctb < cfg["bb_pctb_breakout_min"]:
+            missing.append("bb_pctb_breakout_min")
+            return False
     # If reclaim too extended away from ema20, skip to avoid chasing
     if state == "reclaim":
         dist20 = _pct(_get(f1d, "close", np.nan), _get(f1d, "ema20", np.nan))
