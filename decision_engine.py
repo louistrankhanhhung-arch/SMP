@@ -190,9 +190,10 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
     df1d = d1.get("df", None)
     f1d = d1.get("features", {}) or {}
     # Compute evidence if not provided
+    # Tính evidence an toàn
     ev = evidence
     if ev is None:
-    ev = _safe_eval(features_by_tf)  # dùng helper, không để lỗi bắn ra ngoài
+        ev = _safe_eval(features_by_tf)  # <- dòng này PHẢI thụt 4 spaces
 
     # Build single unified 'out' (không ghi đè lần 2)
     ev_state = ev.get("state") if isinstance(ev, dict) else None
