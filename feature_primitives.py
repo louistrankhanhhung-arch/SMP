@@ -31,6 +31,20 @@ import pandas as pd
 
 from indicators import enrich_indicators
 
+# --- robust coerce helper ---
+def _ensure_series(x):
+    """Return a pandas Series regardless of input being Series/ndarray/list/scalar.
+    Keeps length for array-like; for scalars, returns length-1 Series.
+    """
+    if isinstance(x, pd.Series):
+        return x
+    try:
+        if isinstance(x, (list, tuple, np.ndarray)):
+            return pd.Series(pd.to_numeric(x, errors="coerce"))
+        return pd.Series([pd.to_numeric(x, errors="coerce")])
+    except Exception:
+        return pd.Series([np.nan])
+
 # =========================
 # Helpers
 # =========================
@@ -44,11 +58,11 @@ def _pct(a, b):
 
 def _slope(series: pd.Series, window: int = 5) -> pd.Series:
     # Simple slope: price change over 'window' bars
-    s = pd.to_numeric(series, errors="coerce")
+    s = _ensure_series(pd.to_numeric(series, errors="coerce"))
     return s.diff(window)
 
 def _rolling_extrema(series: pd.Series, window: int = 5, mode: str = "high") -> pd.Series:
-    s = pd.to_numeric(series, errors="coerce")
+    s = _ensure_series(pd.to_numeric(series, errors="coerce"))
     if mode == "high":
         return s.rolling(window, min_periods=1).max()
     else:
@@ -63,7 +77,7 @@ def _pivot_points(high: pd.Series, low: pd.Series, close: pd.Series) -> Tuple[pd
     return P, R1, S1
 
 def _zscore(series: pd.Series, window: int = 20) -> pd.Series:
-    s = pd.to_numeric(series, errors="coerce")
+    s = _ensure_series(pd.to_numeric(series, errors="coerce"))
     mean = s.rolling(window).mean()
     std = s.rolling(window).std(ddof=0)
     return (s - mean) / std
