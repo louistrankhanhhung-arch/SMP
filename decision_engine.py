@@ -223,13 +223,19 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
     # 1) Không có feature 1D -> thiếu dữ liệu
     if not f1d:
         out["missing"].append("missing_features")
+        # Đẩy chi tiết lỗi/warning từ feature stage để debug nhanh
+        err = d1.get("error")
+        if err:
+            out["missing"].append(f"feature_error:{err}")
+        for w in (d1.get("warnings") or []):
+            out["missing"].append(f"warn:{w}")
         _conf = out["confirmations"]
         V_ok = bool(_conf.get("volume", False))
         M_ok = bool(_conf.get("momentum", False))
         C_ok = bool(_conf.get("candles", False))
         out["confirm"] = {"V": V_ok, "M": M_ok, "C": C_ok}
         log_info(f"[{out['symbol']}] DECISION=WAIT | STATE={out.get('STATE')} | DIR={out.get('DIRECTION')} | "
-                 f"reason=missing_features | confirm:V={V_ok} M={M_ok} C={C_ok} | missing={list(out['missing'])}")
+                 f"reason={','.join(out['missing'])} | confirm:V={V_ok} M={M_ok} C={C_ok} | missing={list(out['missing'])}")
         return out
 
     # 2) Có feature: cho _should_enter_long tự append các khóa thiếu vào out["missing"]
