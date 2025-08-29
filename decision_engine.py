@@ -41,6 +41,30 @@ try:
 except Exception:
     _evaluate = None  # type: ignore
 
+# --- Logging shim: đảm bảo có log_info/log_warn/log_err ---
+try:
+    # Nếu bạn có module riêng, import ở đây (tùy codebase của bạn):
+    # from log_utils import log_info, log_warn, log_err
+    raise ImportError  # ép dùng shim bên dưới nếu chưa có
+except Exception:
+    import logging, sys
+    _logger = logging.getLogger("signals")
+    if not _logger.handlers:
+        _h = logging.StreamHandler(sys.stdout)
+        _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        _logger.addHandler(_h)
+        _logger.setLevel(logging.INFO)
+
+    def log_info(msg: str) -> None:
+        _logger.info(msg)
+
+    def log_warn(msg: str) -> None:
+        _logger.warning(msg)
+
+    def log_err(msg: str) -> None:
+        _logger.error(msg)
+# --- end shim ---
+
 # =========================
 # Default configuration
 # =========================
