@@ -171,13 +171,33 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
         out["missing"].append("LONG-only engine: evaluator bias SHORT")
 
     # Decide ENTER/WAIT/AVOID
-    if not f1d:  # no features
+    # 1) Trường hợp không có feature 1D nào (f1d rỗng / None)
+    if not f1d:
         out["missing"].append("missing_features")
+        # In rõ xác nhận V/M/C nếu đã tính trong ev
+        V_ok = bool((ev or {}).get("volume_ok", False))
+        M_ok = bool((ev or {}).get("momentum_ok", False))
+        C_ok = bool((ev or {}).get("candle_ok", False))
+        out["confirm"] = {"V": V_ok, "M": M_ok, "C": C_ok}
+        # sym có thể có trong out (tùy bạn lưu), fallback "?"
+        _sym = out.get("symbol", "?")
+        log_info(f"[{_sym}] DECISION=WAIT | STATE={out.get('state')} | DIR={out.get('dir')} | "
+                 f"reason=missing_features | confirm:V={V_ok} M={M_ok} C={C_ok} | missing={list(out['missing'])}")
         return out
 
+    # 2) Có feature: để _should_enter_long() tự bổ sung 'missing' nếu thiếu khóa con
     can_enter = _should_enter_long(ev or {}, f1d, cfg, out["missing"])
     if not can_enter:
+        V_ok = bool((ev or {}).get("volume_ok", False))
+        M_ok = bool((ev or {}).get("momentum_ok", False))
+        C_ok = bool((ev or {}).get("candle_ok", False))
+        out["confirm"] = {"V": V_ok, "M": M_ok, "C": C_ok}
+        _sym = out.get("symbol", "?")
+        # Nếu _should_enter_long đã append các khóa thiếu vào out["missing"], log ra luôn
+        log_info(f"[{_sym}] DECISION=WAIT | STATE={out.get('state')} | DIR={out.get('dir')} | "
+                 f"reason=missing_features | confirm:V={V_ok} M={M_ok} C={C_ok} | missing={list(out['missing'])}")
         return out
+
 
     # Build plan
     entry_policy = cfg["entry_policy"].get(out["STATE"], "close")
