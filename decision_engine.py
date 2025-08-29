@@ -1,4 +1,3 @@
-
 """
 decision_engine.py — LONG-only trade planner for Vietnam equities
 -----------------------------------------------------------------
@@ -126,7 +125,8 @@ def _get(d: dict, k: str, default=np.nan):
     return d.get(k, default) if isinstance(d, dict) else default
 
 def _pct(a, b) -> float:
-    if b == 0 or np.isnan(a) or np.isnan(b): return float("nan")
+    if b == 0 or np.isnan(a) or np.isnan(b):
+        return float("nan")
     return (a / b - 1.0) * 100.0
 
 def _clamp(v, lo, hi):
@@ -164,7 +164,7 @@ def _should_enter_long(ev: dict, f1d: dict, cfg: dict, missing: List[str]) -> bo
         missing.append("no_evidence")
         return False
     state = ev.get("state", None)
-    if state in ("breakdown","reject") or state is None:
+    if state in ("breakdown", "reject") or state is None:
         missing.append("bearish_or_none_state")
         return False
     if cfg.get("require_validation", True):
@@ -201,46 +201,51 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
     ev = evidence
     if ev is None:
         ev = _safe_eval(features_by_tf)  # <- dòng này PHẢI thụt 4 spaces
+
     # ---------- Fallback: promote to 'bullish_potential' when evaluator is None/bearish ----------
     try:
         if isinstance(ev, dict) is False:
             ev = {}  # normalize
-        ev_state = ev.get(\"state\")
-        if cfg.get(\"allow_bullish_potential\", True) and (ev_state in (None, \"reject\", \"breakdown\")):
-            d1 = features_by_tf.get(cfg[\"primary_tf\"], {}) or {}
-            f1d = (d1.get(\"features\") or {})
-            w1 = features_by_tf.get(\"1W\", {}) or {}
-            f1w = (w1.get(\"features\") or {})
+        ev_state = ev.get("state")
+        if cfg.get("allow_bullish_potential", True) and (ev_state in (None, "reject", "breakdown")):
+            d1 = features_by_tf.get(cfg["primary_tf"], {}) or {}
+            f1d = (d1.get("features") or {})
+            w1 = features_by_tf.get("1W", {}) or {}
+            f1w = (w1.get("features") or {})
 
-            close = float(f1d.get(\"close\", float(\"nan\")))
-            ema20 = float(f1d.get(\"ema20\", float(\"nan\")))
-            ema20_slope5 = float(f1d.get(\"ema20_slope5\", float(\"nan\")))
-            rsi14 = float(f1d.get(\"rsi14\", float(\"nan\")))
+            close = float(f1d.get("close", float("nan")))
+            ema20 = float(f1d.get("ema20", float("nan")))
+            ema20_slope5 = float(f1d.get("ema20_slope5", float("nan")))
+            rsi14 = float(f1d.get("rsi14", float("nan")))
 
             cond_price = (not np.isnan(close) and not np.isnan(ema20) and close > ema20)
-            cond_momo  = ((not np.isnan(ema20_slope5) and ema20_slope5 >= cfg.get(\"fallback_ema20_slope_min\", 0.0)) \
-                           or (not np.isnan(rsi14) and rsi14 >= cfg.get(\"fallback_rsi_trigger\", 50.0)))
+            cond_momo = (
+                (not np.isnan(ema20_slope5) and ema20_slope5 >= cfg.get("fallback_ema20_slope_min", 0.0))
+                or (not np.isnan(rsi14) and rsi14 >= cfg.get("fallback_rsi_trigger", 50.0))
+            )
 
             weekly_ok = True
-            if cfg.get(\"weekly_uptrend_check\", True):
-                w_stack = bool(f1w.get(\"stacked_bull\", False))
-                w_slope = float(f1w.get(\"ema20_slope5\", 0.0))
+            if cfg.get("weekly_uptrend_check", True):
+                w_stack = bool(f1w.get("stacked_bull", False))
+                w_slope = float(f1w.get("ema20_slope5", 0.0))
                 weekly_ok = bool(w_stack or (w_slope > 0.0))
 
             if cond_price and cond_momo and weekly_ok:
                 # Promote to a soft-bull state with conservative confidence
                 ev = dict(ev or {})
-                ev.setdefault(\"notes\", []).append(\"fallback_bullish_potential: close>ema20 & (ema20_slope5>=min or RSI>=trigger) & weekly_ok\")
-                ev[\"state\"] = \"bullish_potential\"
-                ev[\"direction\"] = \"LONG\"
-                ev[\"confidence\"] = max(float(ev.get(\"confidence\", 0.0)), 0.56)
+                ev.setdefault("notes", []).append(
+                    "fallback_bullish_potential: close>ema20 & (ema20_slope5>=min or RSI>=trigger) & weekly_ok"
+                )
+                ev["state"] = "bullish_potential"
+                ev["direction"] = "LONG"
+                ev["confidence"] = max(float(ev.get("confidence", 0.0)), 0.56)
     except Exception:
         # Never break the planner due to fallback errors
         pass
 
     # Build single unified 'out' (không ghi đè lần 2)
-    ev_state = ev.get(\"state\") if isinstance(ev, dict) else None
-    ev_dir   = ev.get(\"direction\") if isinstance(ev, dict) else None
+    ev_state = ev.get("state") if isinstance(ev, dict) else None
+    ev_dir = ev.get("direction") if isinstance(ev, dict) else None
     out: Dict[str, Any] = {
         "symbol": sym,
         "timeframe_primary": cfg["primary_tf"],
@@ -277,10 +282,12 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
         M_ok = bool(_conf.get("momentum", False))
         C_ok = bool(_conf.get("candles", False))
         out["confirm"] = {"V": V_ok, "M": M_ok, "C": C_ok}
-        reason = \",\".join(out[\"missing\"]) if out.get(\"missing\") else \"missing_features\"
-        notes = \"; \".join(out.get(\"notes\", [])) if out.get(\"notes\") else \"\"
-        log_info(f\"[{out['symbol']}] DECISION=WAIT | STATE={out.get('STATE')} | DIR={out.get('DIRECTION')} | \"
-                 f\"reason={reason} | confirm:V={V_ok} M={M_ok} C={C_ok} | notes={notes} | missing={list(out['missing'])}\")
+        reason = ",".join(out["missing"]) if out.get("missing") else "missing_features"
+        notes = "; ".join(out.get("notes", [])) if out.get("notes") else ""
+        log_info(
+            f"[{out['symbol']}] DECISION=WAIT | STATE={out.get('STATE')} | DIR={out.get('DIRECTION')} | "
+            f"reason={reason} | confirm:V={V_ok} M={M_ok} C={C_ok} | notes={notes} | missing={list(out['missing'])}"
+        )
         return out
 
     # 2) Có feature: cho _should_enter_long tự append các khóa thiếu vào out["missing"]
@@ -291,12 +298,13 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
         M_ok = bool(_conf.get("momentum", False))
         C_ok = bool(_conf.get("candles", False))
         out["confirm"] = {"V": V_ok, "M": M_ok, "C": C_ok}
-        reason = \",\".join(out[\"missing\"]) if out.get(\"missing\") else \"missing_features\"
-        notes = \"; \".join(out.get(\"notes\", [])) if out.get(\"notes\") else \"\"
-        log_info(f\"[{out['symbol']}] DECISION=WAIT | STATE={out.get('STATE')} | DIR={out.get('DIRECTION')} | \"
-                 f\"reason={reason} | confirm:V={V_ok} M={M_ok} C={C_ok} | notes={notes} | missing={list(out['missing'])}\")
+        reason = ",".join(out["missing"]) if out.get("missing") else "missing_features"
+        notes = "; ".join(out.get("notes", [])) if out.get("notes") else ""
+        log_info(
+            f"[{out['symbol']}] DECISION=WAIT | STATE={out.get('STATE')} | DIR={out.get('DIRECTION')} | "
+            f"reason={reason} | confirm:V={V_ok} M={M_ok} C={C_ok} | notes={notes} | missing={list(out['missing'])}"
+        )
         return out
-
 
     # Build plan
     entry_policy = cfg["entry_policy"].get(out["STATE"], "close")
@@ -330,11 +338,11 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
 
     # --- Risk size hint: if Volume not confirmed but Momentum/Candles are OK, suggest reduced size ---
     try:
-        confs = out.get(\"confirmations\", {})
-        vol_ok = bool(confs.get(\"volume\", False))
-        mc_ok = bool(confs.get(\"momentum\", False) or confs.get(\"candles\", False))
+        confs = out.get("confirmations", {})
+        vol_ok = bool(confs.get("volume", False))
+        mc_ok = bool(confs.get("momentum", False) or confs.get("candles", False))
         if (not vol_ok) and mc_ok:
-            out[\"risk_size_hint\"] = 0.5  # use half size
+            out["risk_size_hint"] = 0.5  # use half size
     except Exception:
         pass
 
