@@ -156,6 +156,106 @@ def _tp_from_r(entry: float, sl: float, multipliers: List[float]) -> List[float]
     R = entry - sl
     return [float(entry + m * R) for m in multipliers]
 
+def _approx_bands(f1d: dict) -> tuple[float, float, float]:
+    close = _get(f1d, "close", np.nan)
+    ema20 = _get(f1d, "ema20", np.nan)
+    atr14 = _get(f1d, "atr14", np.nan)
+    if np.isnan(ema20) or np.isnan(atr14):
+        return np.nan, np.nan, np.nan
+    mid = float(ema20)
+    up  = float(ema20 + 2.0 * atr14)
+    lo  = float(ema20 - 2.0 * atr14)
+    return lo, mid, up
+
+def _dynamic_tp_multipliers(f1d: dict, overext_pct: float = 6.0) -> list[float]:
+    close = _get(f1d, "close", np.nan)
+    ema20 = _get(f1d, "ema20", np.nan)
+    if np.isnan(close) or np.isnan(ema20):
+        return [1.0, 1.5, 2.0, 2.5, 3.0]
+    dist_pct = abs(close - ema20) / ema20 * 100.0
+    if dist_pct >= overext_pct:
+        return [0.8, 1.2, 1.8, 2.4, 3.0]
+    return [1.0, 1.5, 2.0, 2.5, 3.0]
+
+def _plan_by_state(state: Optional[str], f1d: dict, ev: dict, cfg: dict):
+    """
+    Trả về: entry, entry2, sl, tps(list 5), risk_size_hint(float), notes(list)
+    """
+    notes: list[str] = []
+    rsh = 1.0  # mặc định full size
+    close = _get(f1d, "close", np.nan)
+    ema20 = _get(f1d, "ema20", np.nan)
+    ema50 = _get(f1d, "ema50", np.nan)
+    atr14 = _get(f1d, "atr14", np.nan)
+    lo, mid, up = _approx_bands(f1d)
+    if np.isnan(close):
+        # fallback cứng để không crash
+        entry = entry2 = close
+        sl = close * (1 - cfg["sl_min_pct"]/100.0)
+        tps = _tp_from_r(entry, sl, cfg["tp_multipliers"])
+        return entry, None, sl, tps, rsh, ["fallback: NaN close"]
+
+    vol_ok = bool((ev.get("confirmations") or {}).get("volume", False))
+    dist20 = _pct(close, ema20) if not np.isnan(ema20) else np.nan
+    tp_mult = _dynamic_tp_multipliers(f1d, overext_pct=cfg.get("max_dist_ema20_pct_for_reclaim", 6.0))
+
+    st = (state or "").lower()
+
+    if st in ("breakout", "squeeze_expansion"):
+        entry  = float(close)
+        entry2 = (close - 0.5 * atr14) if not np.isnan(atr14) else None
+        rsh = 0.6 if vol_ok else 0.5
+        notes.append("Plan breakout/squeeze: probe at market, add on -0.5*ATR pullback")
+
+    elif st == "reclaim":
+        # nếu xa EMA20 thì chờ retest; còn không dùng close
+        if not np.isnan(dist20) and dist20 > cfg["max_dist_ema20_pct_for_reclaim"]:
+            entry = float(ema20) if not np.isnan(ema20) else float(close)
+            entry2 = (ema20 - 0.2 * atr14) if (not np.isnan(ema20) and not np.isnan(atr14)) else None
+            notes.append("Plan reclaim: far-from-EMA → wait retest EMA20")
+        else:
+            entry = float(close)
+            entry2 = float(ema20) if not np.isnan(ema20) else None
+            notes.append("Plan reclaim: near-EMA → allow market + EMA20 add")
+        rsh = 0.8
+
+    elif st == "pullback_to_ema":
+        base = mid if not np.isnan(mid) else ema20
+        entry  = float(base) if not np.isnan(base) else float(close)
+        entry2 = (entry - 0.5 * atr14) if not np.isnan(atr14) else None
+        rsh = 1.0
+        notes.append("Plan pullback_to_ema: limit at BB mid/EMA20, add at -0.5*ATR")
+
+    elif st == "mean_revert":
+        base = mid if not np.isnan(mid) else ema20
+        e0 = (close - 0.8 * atr14) if not np.isnan(atr14) else close
+        entry  = float(max(base, e0)) if not np.isnan(base) else float(e0)
+        entry2 = float(ema20) if not np.isnan(ema20) else None
+        rsh = 0.5
+        notes.append("Plan mean_revert: avoid chasing; probe lower + add at EMA20")
+        tp_mult = _dynamic_tp_multipliers(f1d)  # thường rút ngắn vì overextension
+
+    elif st == "bullish_potential":
+        entry  = float(ema20) if not np.isnan(ema20) else float(close)
+        entry2 = (entry - 0.3 * atr14) if not np.isnan(atr14) else None
+        rsh = 0.5
+        notes.append("Plan bullish_potential: cautious near EMA20")
+
+    else:
+        # default an toàn
+        entry  = float(close)
+        entry2 = None
+        rsh = 0.8
+        notes.append("Plan default: simple market entry (conservative size)")
+
+    sl = _compute_sl(entry, f1d,
+                     atr_mult=cfg["atr_sl_mult"],
+                     sl_min_pct=cfg["sl_min_pct"],
+                     sl_max_pct=cfg["sl_max_pct"],
+                     ema_pref_key=cfg["ema_sl_pref"])
+    tps = _tp_from_r(entry, sl, tp_mult)
+    return float(entry), (float(entry2) if entry2 is not None else None), float(sl), tps, float(rsh), notes
+
 # =========================
 # Core planner
 # =========================
@@ -331,23 +431,25 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
     R = entry - sl
     out["rr"]  = float((tps[0] - entry) / R) if R > 0 else None
     out["rr2"] = float((tps[1] - entry) / R) if R > 0 else None
-
-    # --- Risk size hint: if Volume not confirmed but Momentum/Candles are OK, suggest reduced size ---
+    
+    # Gộp risk_size_hint từ kế hoạch & từ validator (thiếu Volume)
+    plan_hint = rsh
     try:
         confs = out.get("confirmations", {})
         vol_ok = bool(confs.get("volume", False))
-        mc_ok = bool(confs.get("momentum", False) or confs.get("candles", False))
-        if (not vol_ok) and mc_ok:
-            out["risk_size_hint"] = 0.5  # use half size
+        mc_ok  = bool(confs.get("momentum", False) or confs.get("candles", False))
+        valid_hint = (0.5 if ((not vol_ok) and mc_ok) else 1.0)
+        final_hint = min(plan_hint or 1.0, valid_hint)
+        if final_hint != 1.0:
+            out["risk_size_hint"] = float(final_hint)
     except Exception:
         pass
-
+    
+    # Nhập notes bổ sung từ plan
+    if extra_notes:
+        out["notes"].extend(extra_notes)
+    
     return out
-    if rsh != 1.0:
-            out["risk_size_hint"] = rsh
-        if extra_notes:
-            out["notes"].extend(extra_notes)
-
 
 if __name__ == "__main__":
     # minimal smoke test
