@@ -99,8 +99,12 @@ def scan_symbols(symbols: List[str]) -> None:
 
     for sym in symbols:
         try:
-            df1d = data_1d.get(sym) or pd.DataFrame()
-            df1w = data_1w.get(sym) or pd.DataFrame()
+            df1d = data_1d.get(sym, None)
+            if df1d is None:
+                df1d = pd.DataFrame()
+            df1w = data_1w.get(sym, None)
+            if df1w is None:
+                df1w = pd.DataFrame()
             if df1d is None or len(df1d) < 30:
                 log_info(f"[{sym}] DECISION=WAIT | reason=insufficient_1D_bars({len(df1d) if df1d is not None else 0})")
                 continue
