@@ -94,6 +94,15 @@ def _derive_features(enriched: pd.DataFrame, timeframe: str) -> dict:
     rsi14 = last["rsi14"]
     atr14, atr_pct = last["atr14"], last["atr_pct"]
     macd_hist = last["macd_hist"]
+    # --- Candle anatomy (bổ sung cho validator nến & pullback)
+    o = float(last["open"]); h = float(last["high"]); l = float(last["low"]); c = float(last["close"])
+    rng = max(1e-9, h - l)
+    body = abs(c - o)
+    upper_wick = max(0.0, h - max(o, c))
+    lower_wick = max(0.0, min(o, c) - l)
+    body_pct = float(body / rng)
+    upper_tail_ratio = float(upper_wick / rng)
+    lower_tail_ratio = float(lower_wick / rng)
     st_k, st_d = last["stoch_k"], last["stoch_d"]
     vol = last.get("volume", np.nan)
 
@@ -166,6 +175,10 @@ def _derive_features(enriched: pd.DataFrame, timeframe: str) -> dict:
         "dist_hi50_pct": dist_hi50, "dist_lo50_pct": dist_lo50,
         "dist_pivot_pct": dist_pivot,
         "vol_regime": vol_regime,
+        # --- bổ sung anatomy để state/validator dùng trực tiếp
+        "body_pct": body_pct,
+        "upper_tail_ratio": upper_tail_ratio,
+        "lower_tail_ratio": lower_tail_ratio,
     }
 
 # =========================
