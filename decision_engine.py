@@ -313,24 +313,20 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
         out["missing"].append("entry_policy_skip_or_nan_price")
         return out
 
-    entry = price  # simple market entry at scan
-    sl = _compute_sl(
-        entry, f1d,
-        atr_mult=cfg["atr_sl_mult"],
-        sl_min_pct=cfg["sl_min_pct"],
-        sl_max_pct=cfg["sl_max_pct"],
-        ema_pref_key=cfg["ema_sl_pref"],
-    )
+    # State-aware planning (flexible entries)
+    entry, entry2, sl, tps, rsh, extra_notes = _plan_by_state(out["STATE"], f1d, ev or {}, cfg)
+
     if sl >= entry:  # safety
         sl = entry * (1.0 - cfg["sl_min_pct"]/100.0)
 
-    tps = _tp_from_r(entry, sl, cfg["tp_multipliers"])
     out.update({
         "DECISION": "ENTER",
         "entry": float(entry),
+        "entry2": (float(entry2) if entry2 is not None else None),
         "sl": float(sl),
         "tp1": tps[0], "tp2": tps[1], "tp3": tps[2], "tp4": tps[3], "tp5": tps[4],
     })
+
     # RR to TP1 and TP2 for quick reference (legacy fields rr, rr2)
     R = entry - sl
     out["rr"]  = float((tps[0] - entry) / R) if R > 0 else None
@@ -347,6 +343,11 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
         pass
 
     return out
+    if rsh != 1.0:
+            out["risk_size_hint"] = rsh
+        if extra_notes:
+            out["notes"].extend(extra_notes)
+
 
 if __name__ == "__main__":
     # minimal smoke test
