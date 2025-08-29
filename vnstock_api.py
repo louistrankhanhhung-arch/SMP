@@ -1,13 +1,10 @@
 """
 vnstock_api.py — Data access layer for Vietnam equities (VN30/HOSE/HNX/UPCoM)
 ------------------------------------------------------------------------------
-- Uses unified `vnstock` package (>=3.2.x). `vnstock3` is deprecated/merged.
+- Uses unified `vnstock` package (>=3.2.x).
 - Fetch OHLCV for 1D & 1W; includes the *running* candle when include_partial=True.
 - Normalized columns: ["ts","open","high","low","close","volume"]
-
-Refs:
-- Install/upgrade: pip install -U vnstock
-- Docs: https://vnstocks.com/docs/tai-lieu/lich-su-phien-ban
+- Tries multiple sources if a provider returns empty/error: ["VCI","SSI","MBS","TVSI","HSC"]
 """
 from __future__ import annotations
 from typing import List, Dict
@@ -16,9 +13,6 @@ import importlib
 
 _TZ = "Asia/Ho_Chi_Minh"
 
-# ---------------------
-# Version / provider
-# ---------------------
 def _check_provider() -> str:
     try:
         mod = importlib.import_module("vnstock")
@@ -63,14 +57,11 @@ def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df.dropna(subset=["ts"]).sort_values("ts").reset_index(drop=True)
 
-# ---------------------
-# Core fetchers
-# ---------------------
 def fetch_ohlcv(symbol: str, timeframe: str = "1D", limit: int = 600, include_partial: bool = True) -> pd.DataFrame:
     """Fetch OHLCV for a single symbol using `vnstock` Quote.history.
-    timeframe in {"1D","1W"}
+    timeframe in {"1D","1W"}; tries multiple sources if needed.
     """
-    ver = _check_provider()  # ensures importable
+    ver = _check_provider()
     from vnstock import Vnstock, Quote  # type: ignore
 
     tf = timeframe.upper()
@@ -80,17 +71,34 @@ def fetch_ohlcv(symbol: str, timeframe: str = "1D", limit: int = 600, include_pa
     start = _infer_start_date(limit=limit, timeframe=tf)
     end = _now_vn().strftime("%Y-%m-%d")
 
-    # Prefer class Quote; fallback to Vnstock().stock(...).quote
-    try:
-        quote = Quote(symbol=symbol, source="VCI")  # default source
-        raw = quote.history(start=start, end=end, interval=tf)
-    except Exception:
-        stock = Vnstock().stock(symbol=symbol, source="VCI")
-        raw = stock.quote.history(start=start, end=end, interval=tf)
+    sources = ["VCI", "SSI", "MBS", "TVSI", "HSC"]
+    last_err = None
+    df = None
+    used = None
+    for src_name in sources:
+        try:
+            try:
+                quote = Quote(symbol=symbol, source=src_name)
+                raw = quote.history(start=start, end=end, interval=tf)
+            except Exception:
+                stock = Vnstock().stock(symbol=symbol, source=src_name)
+                raw = stock.quote.history(start=start, end=end, interval=tf)
+            df_tmp = _normalize_df(raw)
+            if len(df_tmp) > 0:
+                df = df_tmp
+                used = src_name
+                break
+        except Exception as e:
+            last_err = str(e)
+            continue
 
-    df = _normalize_df(raw)
+    if df is None:
+        df = pd.DataFrame(columns=["ts","open","high","low","close","volume"])
+        if last_err:
+            df.attrs["error"] = last_err
+        df.attrs["source_tried"] = ",".join(sources)
+        return df
 
-    # Drop incomplete bar if requested
     if not include_partial and len(df) > 0:
         last = df.iloc[-1]["ts"]
         if tf == "1D":
@@ -103,6 +111,9 @@ def fetch_ohlcv(symbol: str, timeframe: str = "1D", limit: int = 600, include_pa
 
     if limit and len(df) > limit:
         df = df.iloc[-limit:].reset_index(drop=True)
+
+    if used:
+        df.attrs["source_used"] = used
     return df
 
 def fetch_ohlcv_batch(symbols: List[str], timeframe: str = "1D", limit: int = 600, include_partial: bool = True) -> Dict[str, pd.DataFrame]:
@@ -136,7 +147,7 @@ if __name__ == "__main__":
     try:
         print("vnstock version:", _check_provider())
         test_df = fetch_ohlcv("VCB", timeframe="1D", limit=100, include_partial=True)
-        print("Fetched rows:", len(test_df))
+        print("Fetched rows:", len(test_df), "| source_used:", test_df.attrs.get("source_used"))
         print(test_df.tail())
     except Exception as e:
         print("Self-test failed:", e)
