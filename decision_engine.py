@@ -278,6 +278,9 @@ def _should_enter_long(ev: dict, f1d: dict, cfg: dict, missing: List[str]) -> bo
         # Siết riêng cho breakout: Volume OR (Momentum AND Candles)
         if st == "breakout":
             gate_ok = bool(val.get("volume") or (val.get("momentum") and val.get("candles")))
+        # Khuyến nghị: với squeeze_expansion, yêu cầu có Candles (ATR push) hoặc Volume
+        if st == "squeeze_expansion":
+            gate_ok = bool(val.get("volume") or val.get("candles"))
             if not gate_ok:
                 missing.append("breakout_requires_volume OR (momentum AND candles)")
         if not gate_ok:
