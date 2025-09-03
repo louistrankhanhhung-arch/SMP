@@ -7,7 +7,7 @@ main.py — VN Stocks Signal Scanner (LONG-only)
 - Fetch OHLCV 1D & 1W (include running candles)
 - Compute features -> evaluate evidence -> decide plan (LONG-only)
 - Pretty console logs with TP ladder & direction
-- Scheduler: 2 runs per day (Mon–Fri): 11:30 and 15:00 Asia/Ho_Chi_Minh
+- Scheduler: 5 runs per day (Mon–Fri): 09:30, 10:30, 11:30, 14:00, 15:00 Asia/Ho_Chi_Minh
 - To avoid congestion: split universe into 7 blocks; each block runs 5 minutes apart
 
 ENV overrides (optional):
@@ -148,9 +148,10 @@ def run_in_blocks(symbols: List[str], blocks: int, delay_min: int) -> None:
             time.sleep(delay_min * 60)
 
 # ------------------------------
-# Daily schedule (Mon–Fri at 11:30 and 15:00 VN time)
+# Daily schedule (Mon–Fri at 09:30, 10:30, 11:30, 14:00, 15:00 VN time)
+# (UTC: 02:30, 03:30, 04:30, 07:00, 08:00)
 # ------------------------------
-RUN_TIMES = [(11,30), (15,0)]
+RUN_TIMES = [(9,30), (10,30), (11,30), (14,0), (15,0)]
 
 def is_weekday(dt: datetime) -> bool:
     # Monday=0 ... Sunday=6
