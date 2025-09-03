@@ -119,6 +119,8 @@ DEFAULT_CFG = {
     "primary_tf": "1D",
     # Reclaim proximity tolerance (price not too extended from EMA)
     "max_dist_ema20_pct_for_reclaim": 6.0,
+    # Emit setup even if DECISION=WAIT for these states
+    "emit_plan_on_wait_states": ["bullish_potential"],
 }
 
 # =========================
@@ -422,6 +424,36 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
         M_ok = bool(_conf.get("momentum", False))
         C_ok = bool(_conf.get("candles", False))
         out["confirm"] = {"V": V_ok, "M": M_ok, "C": C_ok}
+
+        # NEW: vẫn phát hành setup khi WAIT nếu state được cho phép
+        st_lower = (out.get("STATE") or "").lower()
+        if st_lower and (st_lower in (cfg.get("emit_plan_on_wait_states") or [])):
+            entry_policy = cfg["entry_policy"].get(out["STATE"], "close")
+            price = float(_get(f1d, "close", np.nan))
+            if entry_policy != "skip" and not np.isnan(price):
+                entry, entry2, sl, tps, rsh, extra_notes = _plan_by_state(out["STATE"], f1d, ev or {}, cfg)
+                if sl >= entry:  # safety clamp
+                    sl = entry * (1.0 - cfg["sl_min_pct"]/100.0)
+                out.update({
+                    "entry": float(entry),
+                    "entry2": (float(entry2) if entry2 is not None else None),
+                    "sl": float(sl),
+                    "tp1": tps[0], "tp2": tps[1], "tp3": tps[2], "tp4": tps[3], "tp5": tps[4],
+                })
+                # RR quick refs
+                R = entry - sl
+                out["rr"]  = float((tps[0] - entry) / R) if R > 0 else None
+                out["rr2"] = float((tps[1] - entry) / R) if R > 0 else None
+                # Risk-size hint nếu thiếu volume
+                try:
+                    vol_ok = bool(_conf.get("volume", False))
+                    mc_ok  = bool(_conf.get("momentum", False) or _conf.get("candles", False))
+                    valid_hint = (0.5 if ((not vol_ok) and mc_ok) else 1.0)
+                    out["risk_size_hint"] = float(min(rsh or 1.0, valid_hint))
+                except Exception:
+                    pass
+                out["notes"].append("setup_on_WAIT: emitted plan for bullish_potential (idea only)")
+
         reason = ",".join(out["missing"]) if out.get("missing") else "missing_features"
         notes = "; ".join(out.get("notes", [])) if out.get("notes") else ""
         log_info(
