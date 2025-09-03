@@ -54,6 +54,13 @@ def log_err(msg: str):
 # ------------------------------
 # Formatting helpers
 # ------------------------------
+# Number of decimals for price-like fields in logs.
+# Can be overridden via env PRICE_DP (default: 1)
+try:
+    PRICE_DP = int(os.getenv("PRICE_DP", "1"))
+except Exception:
+    PRICE_DP = 1
+
 def format_plan(sym: str, plan: dict) -> str:
     dec = plan.get("DECISION")
     state = plan.get("STATE")
@@ -66,8 +73,8 @@ def format_plan(sym: str, plan: dict) -> str:
 
     if dec == "ENTER":
         return (f"[{sym}] DECISION=ENTER | STATE={state} | DIR={direction} | "
-                f"entry={_round(entry)} sl={_round(sl)} "
-                f"TP1={_round(tp1)} TP2={_round(tp2)} TP3={_round(tp3)} TP4={_round(tp4)} TP5={_round(tp5)} "
+                f"entry={_round(entry, PRICE_DP)} sl={_round(sl, PRICE_DP)} "
+                f"TP1={_round(tp1, PRICE_DP)} TP2={_round(tp2, PRICE_DP)} TP3={_round(tp3, PRICE_DP)} TP4={_round(tp4, PRICE_DP)} TP5={_round(tp5, PRICE_DP)} "
                 f"rr={_round(rr,2)} rr2={_round(rr2,2)} "
                 f"| confirm:V={conf.get('volume',False)} M={conf.get('momentum',False)} C={conf.get('candles',False)}")
     else:
