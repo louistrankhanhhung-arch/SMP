@@ -72,6 +72,13 @@ def format_plan(sym: str, plan: dict) -> str:
                 f"| confirm:V={conf.get('volume',False)} M={conf.get('momentum',False)} C={conf.get('candles',False)}")
     else:
         why = (", ".join(miss)) if miss else "-"
+        # NEW: nếu đã có setup kèm DECISION=WAIT -> in gọn setup để trader cân nhắc
+        if plan.get("entry") and plan.get("sl") and plan.get("tp1"):
+            return (f"[{sym}] DECISION=WAIT (SETUP) | STATE={state} | DIR={direction} | "
+                    f"entry={_round(entry)} sl={_round(sl)} "
+                    f"TP1={_round(tp1)} TP2={_round(tp2)} TP3={_round(tp3)} TP4={_round(tp4)} TP5={_round(tp5)} "
+                    f"rr={_round(rr,2)} rr2={_round(rr2,2)} "
+                    f"| reason={why} | confirm:V={conf.get('volume',False)} M={conf.get('momentum',False)} C={conf.get('candles',False)}")
         return (f"[{sym}] DECISION={dec} | STATE={state} | DIR={direction} | reason={why} "
                 f"| confirm:V={conf.get('volume',False)} M={conf.get('momentum',False)} C={conf.get('candles',False)}")
 
