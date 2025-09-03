@@ -46,6 +46,7 @@ DEFAULT_CFG = {
     'near_ema_pct': 1.5,       # pullback to ema20/50 threshold
     'near_sr_pct': 1.0,        # pivot/SR proximity
     'breakout_buffer_pct': 0.5,# must clear hi20 by this percent
+    'breakdown_buffer_pct': 0.5,
     # --- New: ngưỡng chuyên biệt theo state
     'rsi_breakout_min': 60.0,
     'bb_pctb_breakout_min': 0.80,
@@ -216,7 +217,7 @@ def _pullback_to_ema(df1d: pd.DataFrame, f1d: dict, cfg: dict) -> Tuple[float, s
 
 def _mean_revert(df1d: pd.DataFrame, f1d: dict, cfg: dict) -> Tuple[float, str]:
     pctb = _get(f1d, 'bb_pctb', np.nan)
-    zone = (not np.isnan(pctb)) and (pctb <= DEFAULT_CFG['meanrevert_band_edge'] or pctb >= (1.0 - DEFAULT_CFG['meanrevert_band_edge']))
+    zone = (not np.isnan(pctb)) and (pctb <= cfg['meanrevert_band_edge'] or pctb >= (1.0 - cfg['meanrevert_band_edge']))
     score = 0.5 if zone else 0.0
     note = "extreme band edge (bb_pctb)" if zone else "n/a"
     return score, note
@@ -225,23 +226,13 @@ def _squeeze_expansion(df1d: pd.DataFrame, f1d: dict, prev1d: dict | None, cfg: 
     bw = _get(f1d, 'bb_width', np.nan); bw_prev = _get(prev1d, 'bb_width', np.nan) if prev1d else np.nan
     low = (not np.isnan(bw)) and (bw <= cfg['bb_width_low'])
     expanding = (not np.isnan(bw) and not np.isnan(bw_prev)) and ((bw - bw_prev) >= cfg['bb_width_expand'])
-    score = 0.45 if (low and expanding) else (0.25 if expanding else 0.0)
-    note = "squeeze expanding" if (low or expanding) else "n/a"
-    # Yêu cầu bung nén có "push" thật: ATR push + break high gần nhất; khuyến nghị kèm volume
-    bb_w = _get(f1d, 'bb_width', np.nan)
-    bb_w_prev = _get(prev1d, 'bb_width', np.nan) if prev1d else np.nan
-    atr14 = _get(f1d, 'atr14', np.nan)
-    row = df1d.iloc[-1] if isinstance(df1d, pd.DataFrame) and len(df1d) else None
-    prev_row = df1d.iloc[-2] if isinstance(df1d, pd.DataFrame) and len(df1d) >= 2 else None
-    rng = float(row['range']) if row is not None else np.nan
-    close = float(row['close']) if row is not None else np.nan
-    prev_high = float(prev_row['high']) if prev_row is not None else np.nan
+    # Chuẩn hóa: chỉ nhận khi có bùng nén thật sự
+    expanding = (not np.isnan(bw) and not np.isnan(bw_prev) and (bw - bw_prev) >= cfg['bb_width_expand'])
     push = (not np.isnan(atr14) and not np.isnan(rng) and rng >= 0.8 * atr14)
     break_high = (not np.isnan(close) and not np.isnan(prev_high) and close > prev_high)
-    expanding = (not np.isnan(bb_w) and not np.isnan(bb_w_prev) and bb_w > bb_w_prev)
-    ok = bool(expanding and push and break_high)
+    ok = bool((low or expanding) and push and break_high)
     score = 0.60 if ok else 0.0
-    note = "squeeze_expansion: expanding + ATR push + close>high[-1]" if ok else "n/a"
+    note = "squeeze_expansion: low/expanding + ATR push + close>high[-1]" if ok else "n/a"
     return score, note
 
 # =========================
@@ -289,6 +280,7 @@ def evaluate(features_by_tf: Dict[str, dict], *, cfg: dict | None = None) -> dic
             'pivot': float(prev_row.get('pivot', np.nan)),
             'bb_width': float(prev_row.get('bb_width', np.nan)),
             'macd_hist': float(prev_row.get('macd_hist', np.nan)),
+            'vol_ratio': float(prev_row.get('vol_ratio', np.nan)),
         }
 
     # Compute state scores
