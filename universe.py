@@ -11,7 +11,7 @@ DEFAULT_UNIVERSE: List[str] = [
     "BVH","BMI","BSR","PVD","PVS","PVT","GAS",
     "POW","NT2","REE","DIG","KDH","NLG","HDC",
     "HDG","PDR","KBC","SZC","HHV","VCG","CTD","CII",
-    "HPG","HSG","NKG","DGW","MWG","FPT","MSN",
+    "HPG","HSG","NKG","DGW","MWG","FPT","CMG","MSN",
     "VSC","GMD","CSV","DCM","DPM",
 ]
 
