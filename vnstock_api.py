@@ -15,7 +15,7 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional
 import pandas as pd
 import importlib
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dtime
 
 try:
     import pytz
@@ -231,9 +231,9 @@ def _to_date(limit: int) -> Tuple[str, str]:
 
 def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or len(df) == 0:
-        return pd.DataFrame(columns=["ts","open","high","low","close","volume"])
+        return pd.DataFrame(columns=["time","open","high","low","close","volume"])
     rename_map = {
-        "time": "ts", "date": "ts", "TradingDate": "ts", "tradingDate": "ts",
+        "time": "time", "date": "time", "TradingDate": "time", "tradingDate": "time",
         "open": "open", "Open": "open", "o": "open",
         "high": "high", "High": "high", "h": "high",
         "low": "low", "Low": "low", "l": "low",
@@ -241,17 +241,17 @@ def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
         "volume": "volume", "Volume": "volume", "v": "volume", "value": "volume",
     }
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
-    keep = [c for c in ["ts","open","high","low","close","volume"] if c in df.columns]
+    keep = [c for c in ["time","open","high","low","close","volume"] if c in df.columns]
     df = df[keep].copy()
-    # Normalize timestamp to pandas datetime (naive, VN local)
-    if "ts" in df.columns:
-        df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+    # Normalize timestamp → VN timezone
+    if "time" in df.columns:
+        df["time"] = _to_vn_tz(df["time"])
     # Coerce numerics
     for c in ["open","high","low","close","volume"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-    # Drop rows without ts
-    df = df.dropna(subset=["ts"]).sort_values("ts").reset_index(drop=True)
+    # Drop rows without time
+    df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
     return df
 
 def _symbol_variants(sym: str) -> List[str]:
@@ -291,8 +291,8 @@ def _history_with_fallbacks(obj, start: str, end: str, tf: str):
 def _drop_running_bar_if_needed(df: pd.DataFrame, timeframe: str, include_partial: bool) -> pd.DataFrame:
     if include_partial or len(df) == 0:
         return df
-    # For 1D: drop bar if last ts is "today" VN time (market not closed/committed yet)
-    last_ts = pd.to_datetime(df["ts"].iloc[-1])
+    # For 1D: drop bar if last time is "today" VN time (market not closed/committed yet)
+    last_ts = pd.to_datetime(df["time"].iloc[-1])
     today_vn = _now_vn().date()
     if timeframe.upper().startswith("1D") and last_ts.date() >= today_vn:
         return df.iloc[:-1].copy()
@@ -338,7 +338,7 @@ def fetch_ohlcv(symbol: str, timeframe: str = "1D", limit: int = 600, include_pa
             break
 
     if df is None:
-        df = pd.DataFrame(columns=["ts","open","high","low","close","volume"])
+        df = pd.DataFrame(columns=["time","open","high","low","close","volume"])
         if last_err:
             df.attrs["error"] = last_err
         df.attrs["source_tried"] = ",".join(_SUPPORTED_SOURCES)
@@ -347,6 +347,14 @@ def fetch_ohlcv(symbol: str, timeframe: str = "1D", limit: int = 600, include_pa
 
     # Optionally drop the running bar
     df = _drop_running_bar_if_needed(df, timeframe, include_partial)
+
+    # Final sanitize to our strict schema (time, tz, numerics, dedupe, order)
+    df = _sanitize_ohlcv(df)
+
+    # Quality report for clarity (DATA_GAP)
+    q = _quality_report(df)
+    if not q["ok"]:
+        print(f"[{symbol}] DATA_GAP -> {q['issues']}")
 
     # Attach metadata
     if used_src:
