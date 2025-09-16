@@ -32,6 +32,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from indicators import enrich_indicators
+from numpy import errstate
 VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
 # --- robust coerce helper ---
@@ -211,23 +212,24 @@ def enrich_and_features(df: pd.DataFrame, timeframe: str) -> dict:
     if df is None or len(df) == 0:
         return {'timeframe': timeframe, 'df': df, 'features': {}}
     e = enrich_indicators(df)
-    # --- PATCH: expose per-row volume diagnostics for validators/state ---
+    # --- PATCH: expose volume diagnostics as columns for benchmark logging ---
     try:
         if "volume" in e.columns:
-            # previous 20-day average volume (aligned with current row via shift(1))
+            # MA20 của volume, canh hàng hiện tại bằng shift(1) để so với volume đã chốt
             vol_ma20_prev = e["volume"].shift(1).rolling(20).mean()
             e["vol_ma20"] = vol_ma20_prev
-            with np.errstate(divide='ignore', invalid='ignore'):
+            with errstate(divide='ignore', invalid='ignore'):
                 e["vol_ratio"] = e["volume"] / vol_ma20_prev
-            # zscore of previous volumes (same alignment as above)
+            # Z-score của volume (dựa trên dãy prev_vol)
             prev_vol = e["volume"].shift(1)
             mu = prev_vol.rolling(20).mean()
             sigma = prev_vol.rolling(20).std(ddof=0)
-            with np.errstate(divide='ignore', invalid='ignore'):
+            with errstate(divide='ignore', invalid='ignore'):
                 e["vol_z"] = (prev_vol - mu) / sigma
     except Exception:
-        # never let diagnostics break enrichment
+        # không để logging diagnostics làm vỡ enrichment
         pass
+
     feats = _derive_features(e, timeframe=timeframe)
     out = {'timeframe': timeframe, 'df': e, 'features': feats}
     try:
