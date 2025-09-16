@@ -91,7 +91,10 @@ def _zscore(series: pd.Series, window: int = 20) -> pd.Series:
 # =========================
 def _last_closed_idx(enriched: pd.DataFrame) -> int:
     try:
-        ts = enriched["ts"].iloc[-1]
+        ts_col = "ts" if "ts" in enriched.columns else ("time" if "time" in enriched.columns else None)
+        if ts_col is None:
+            raise KeyError("no ts/time column")
+        ts = enriched[ts_col].iloc[-1]
         now = datetime.now(VN_TZ)
         if hasattr(ts, "date") and ts.date() == now.date() and now.hour < 15 and len(enriched) >= 2:
             return -2
@@ -211,7 +214,14 @@ def enrich_and_features(df: pd.DataFrame, timeframe: str) -> dict:
     """
     if df is None or len(df) == 0:
         return {'timeframe': timeframe, 'df': df, 'features': {}}
-    e = enrich_indicators(df)
+    # Chuẩn cột ts trước khi enrich để các rolling/snapshot ổn định
+    dfc = df.copy()
+    if "ts" not in dfc.columns and "time" in dfc.columns:
+        try:
+            dfc["ts"] = pd.to_datetime(dfc["time"], errors="coerce")
+        except Exception:
+            pass
+    e = enrich_indicators(dfc)
     # --- PATCH: expose volume diagnostics as columns for benchmark logging ---
     try:
         if "volume" in e.columns:
