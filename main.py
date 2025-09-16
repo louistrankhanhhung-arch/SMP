@@ -95,7 +95,7 @@ def format_plan(sym: str, plan: dict) -> str:
                 f"| confirm:V={conf.get('volume',False)} M={conf.get('momentum',False)} C={conf.get('candles',False)}"
                 f"{' | validators: ' + vline if vline else ''}"
                 f"{' | ' + vcheck if vcheck else ''}"
-                f"{(f' | conf={conf_val:.2f}/min={conf_min:.2f}') if (isinstance(conf_val,(int,float)) and isinstance(conf_min,(int,float))) else ''}")
+                f"{(f' | conf={conf_val:.2f}/min={conf_min:.2f}') if (isinstance(conf_val,(int,float)) and isinstance(conf_min,(int,float))) else ''}"
                 f"{' | DATA_GAP: ' + ','.join(map(str,data_issues)) if (data_ok is False) else ''}"
     else:
         why = (", ".join(miss)) if miss else "-"
@@ -166,7 +166,7 @@ def scan_symbols(symbols: List[str]) -> None:
             # NEW: nếu vẫn có bar hôm nay và đang trước 15:00 → drop bar chạy
             if df1d is not None and len(df1d) > 0 and now.hour < 15:
                 try:
-                    last_ts = df1d["ts"].iloc[-1]
+                    last_ts = df1d["time"].iloc[-1]
                     if hasattr(last_ts, "date") and last_ts.date() == now.date():
                         df1d = df1d.iloc[:-1].reset_index(drop=True)
                 except Exception as _e:
