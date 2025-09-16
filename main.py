@@ -107,7 +107,10 @@ def scan_symbols(symbols: List[str]) -> None:
         return
     log_info(f"Scanning {len(symbols)} symbols ...")
     # Fetch once per TF for the whole block
-    data_1d = fetch_ohlcv_batch(symbols, timeframe="1D", limit=420, include_partial=True)
+    # NEW: tránh dùng nến 1D đang chạy trong giờ giao dịch
+    now = now_vn()
+    include_partial_daily = False if now.hour < 15 else True
+    data_1d = fetch_ohlcv_batch(symbols, timeframe="1D", limit=420, include_partial=include_partial_daily)
     data_1w = fetch_ohlcv_batch(symbols, timeframe="1W", limit=260, include_partial=True)
 
     for sym in symbols:
@@ -126,11 +129,19 @@ def scan_symbols(symbols: List[str]) -> None:
                 dbg = getattr(df1d, "attrs", {}).get("debug")
                 if src_tried or err or dbg:
                     log_info(f"[{sym}] 1D empty | debug={dbg} | source_tried={src_tried} | error={err}")
-                # Try smaller limit & no date cut
-                df1d = fetch_ohlcv(sym, timeframe="1D", limit=120, include_partial=True)
+                # Try smaller limit & no date cut (still avoid partial during session)
+                df1d = fetch_ohlcv(sym, timeframe="1D", limit=120, include_partial=(now.hour >= 15))
                 if len(df1d) == 0:
                     # Try exclude running bar (some providers only commit after close)
                     df1d = fetch_ohlcv(sym, timeframe="1D", limit=120, include_partial=False)
+            # NEW: nếu vẫn có bar hôm nay và đang trước 15:00 → drop bar chạy
+            if df1d is not None and len(df1d) > 0 and now.hour < 15:
+                try:
+                    last_ts = df1d["ts"].iloc[-1]
+                    if hasattr(last_ts, "date") and last_ts.date() == now.date():
+                        df1d = df1d.iloc[:-1].reset_index(drop=True)
+                except Exception as _e:
+                    log_info(f"[{sym}] skip-drop-running-bar (info): {_e}")
             if df1d is None or len(df1d) < 30:
                 log_info(f"[{sym}] DECISION=WAIT | reason=insufficient_1D_bars({len(df1d) if df1d is not None else 0})")
                 continue
