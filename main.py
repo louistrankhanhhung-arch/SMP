@@ -36,6 +36,16 @@ from decision_engine import decide
 
 VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
+REQUIRED_COLS = ["close","volume","atr14","range","body_pct","rsi14","macd_hist"]
+
+def _df_status(df: pd.DataFrame):
+    issues = []
+    if not isinstance(df, pd.DataFrame): return False, ["df_none"]
+    if len(df) < 25: issues.append(f"rows_lt_25({len(df)})")
+    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    if missing: issues.append(f"missing_cols:{missing}")
+    return (len(issues)==0), issues
+
 # ------------------------------
 # Logging helpers
 # ------------------------------
@@ -73,6 +83,9 @@ def format_plan(sym: str, plan: dict) -> str:
     vline = plan.get("validator_line", "")
     vcheck = plan.get("validator_checklist", "")
     conf_val = plan.get("confidence", None); conf_min = plan.get("min_conf_enter", None)
+    vreport = plan.get("validator_report", {})
+    data_ok = vreport.get("data_ok", True) if isinstance(vreport, dict) else True
+    data_issues = vreport.get("data_issues", []) if isinstance(vreport, dict) else [] 
 
     if dec == "ENTER":
         return (f"[{sym}] DECISION=ENTER | STATE={state} | DIR={direction} | "
@@ -83,6 +96,7 @@ def format_plan(sym: str, plan: dict) -> str:
                 f"{' | validators: ' + vline if vline else ''}"
                 f"{' | ' + vcheck if vcheck else ''}"
                 f"{(f' | conf={conf_val:.2f}/min={conf_min:.2f}') if (isinstance(conf_val,(int,float)) and isinstance(conf_min,(int,float))) else ''}")
+                f"{' | DATA_GAP: ' + ','.join(map(str,data_issues)) if (data_ok is False) else ''}"
     else:
         why = (", ".join(miss)) if miss else "-"
         # NEW: nếu đã có setup kèm DECISION=WAIT -> in gọn setup để trader cân nhắc
@@ -94,14 +108,17 @@ def format_plan(sym: str, plan: dict) -> str:
                     f"| reason={why} | confirm:V={conf.get('volume',False)} M={conf.get('momentum',False)} C={conf.get('candles',False)}"
                     f"{' | validators: ' + vline if vline else ''}"
                     f"{' | ' + vcheck if vcheck else ''}"
-                    f"{(f' | conf={conf_val:.2f}/min={conf_min:.2f}') if (isinstance(conf_val,(int,float)) and isinstance(conf_min,(int,float))) else ''}")
+                    f"{(f' | conf={conf_val:.2f}/min={conf_min:.2f}') if (isinstance(conf_val,(int,float)) and isinstance(conf_min,(int,float))) else ''}"
+                    f"{' | DATA_GAP: ' + ','.join(map(str,data_issues)) if (data_ok is False) else ''}"
+                   )
         return (f"[{sym}] DECISION={dec} | STATE={state} | DIR={direction} | reason={why} "
                 f"| confirm:V={conf.get('volume',False)} M={conf.get('momentum',False)} C={conf.get('candles',False)}"
                 f"{' | validators: ' + vline if vline else ''}"
                 f"{' | ' + vcheck if vcheck else ''}"
-                f"{(f' | conf={conf_val:.2f}/min={conf_min:.2f}') if (isinstance(conf_val,(int,float)) and isinstance(conf_min,(int,float))) else ''}")
+                f"{(f' | conf={conf_val:.2f}/min={conf_min:.2f}') if (isinstance(conf_val,(int,float)) and isinstance(conf_min,(int,float))) else ''}"
+                f"{' | DATA_GAP: ' + ','.join(map(str,data_issues)) if (data_ok is False) else ''}")
 
-def _round(x, n=0):
+def _round(x, n=2):
     if x is None:
         return None
     try:
