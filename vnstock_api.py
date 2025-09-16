@@ -331,6 +331,22 @@ def fetch_ohlcv(symbol: str, timeframe: str = "1D", limit: int = 600, include_pa
     if meta_used:
         for k, v in meta_used.items():
             df.attrs[k] = v
+
+    # 🔧 Hợp thức hóa cột thời gian cho downstream: tạo 'ts' từ 'time'
+    try:
+        if df is not None and len(df) and "ts" not in df.columns and "time" in df.columns:
+            ts = pd.to_datetime(df["time"], errors="coerce")
+            # ưu tiên timezone VN nếu có thể (để _last_closed_idx hoạt động chuẩn phiên VN)
+            try:
+                from zoneinfo import ZoneInfo
+                tz = ZoneInfo("Asia/Ho_Chi_Minh")
+                if getattr(ts, "dt", None) is not None and ts.dt.tz is None:
+                    ts = ts.dt.tz_localize(tz, nonexistent="shift_forward", ambiguous="NaT")
+            except Exception:
+                pass
+            df["ts"] = ts
+    except Exception as _e:
+        df.attrs["warn_ts_create"] = str(_e)
     return df
 
 def fetch_ohlcv_batch(symbols: List[str], timeframe: str = "1D", limit: int = 600, include_partial: bool = True) -> Dict[str, pd.DataFrame]:
