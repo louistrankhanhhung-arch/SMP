@@ -64,6 +64,34 @@ except Exception:
         _logger.error(msg)
 # --- end shim ---
 
+# --- DEBUG VALIDATORS FLAG ---
++try:
++    import os
++    DEBUG_VALIDATORS = bool(int(os.getenv("DEBUG_VALIDATORS", "0")))
++except Exception:
++    DEBUG_VALIDATORS = False
++
+def _debug_dump_validators(symbol: str, f1d: dict, confirmations: dict):
+    if not DEBUG_VALIDATORS:
+        return
+    try:
+        v = {
+            "vol": f1d.get("vol"),
+            "vol_ma20": f1d.get("vol_ma20"),
+            "vol_ratio": f1d.get("vol_ratio"),
+            "vol_z": f1d.get("vol_z"),
+            "rsi14": f1d.get("rsi14"),
+            "macd_hist": f1d.get("macd_hist"),
+            "body_pct": f1d.get("body_pct"),
+            "atr14": f1d.get("atr14"),
+        }
+        conf = confirmations or {}
+        log_info(f"[{symbol}] DEBUG_VALIDATORS V={conf.get('volume',False)} M={conf.get('momentum',False)} C={conf.get('candles',False)} | "
+                 f"vol={v['vol']} vol_ma20={v['vol_ma20']} vol_ratio={v['vol_ratio']} vol_z={v['vol_z']} "
+                 f"rsi14={v['rsi14']} macd_hist={v['macd_hist']} body_pct={v['body_pct']} atr14={v['atr14']}")
+    except Exception:
+        pass
+
 def _safe_eval(features_all):
     if _evaluate is None:
         return None
@@ -420,6 +448,7 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
         M_ok = bool(_conf.get("momentum", False))
         C_ok = bool(_conf.get("candles", False))
         out["confirm"] = {"V": V_ok, "M": M_ok, "C": C_ok}
+        _debug_dump_validators(out["symbol"], f1d, out.get("confirmations", {}))
         reason = ",".join(out["missing"]) if out.get("missing") else "missing_features"
         notes = "; ".join(out.get("notes", [])) if out.get("notes") else ""
         log_info(
@@ -470,6 +499,7 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
         M_ok = bool(_conf.get("momentum", False))
         C_ok = bool(_conf.get("candles", False))
         out["confirm"] = {"V": V_ok, "M": M_ok, "C": C_ok}
+        _debug_dump_validators(out["symbol"], f1d, out.get("confirmations", {}))
 
         # NEW: vẫn phát hành setup khi WAIT nếu state được cho phép
         st_lower = (out.get("STATE") or "").lower()
