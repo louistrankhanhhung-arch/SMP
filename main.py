@@ -70,13 +70,19 @@ def format_plan(sym: str, plan: dict) -> str:
     rr = plan.get("rr"); rr2 = plan.get("rr2")
     miss = plan.get("missing", [])
     conf = plan.get("confirmations", {})
+    vline = plan.get("validator_line", "")
+    vcheck = plan.get("validator_checklist", "")
+    conf_val = plan.get("confidence", None); conf_min = plan.get("min_conf_enter", None)
 
     if dec == "ENTER":
         return (f"[{sym}] DECISION=ENTER | STATE={state} | DIR={direction} | "
                 f"entry={_round(entry, PRICE_DP)} sl={_round(sl, PRICE_DP)} "
                 f"TP1={_round(tp1, PRICE_DP)} TP2={_round(tp2, PRICE_DP)} TP3={_round(tp3, PRICE_DP)} TP4={_round(tp4, PRICE_DP)} TP5={_round(tp5, PRICE_DP)} "
                 f"rr={_round(rr,2)} rr2={_round(rr2,2)} "
-                f"| confirm:V={conf.get('volume',False)} M={conf.get('momentum',False)} C={conf.get('candles',False)}")
+                f"| confirm:V={conf.get('volume',False)} M={conf.get('momentum',False)} C={conf.get('candles',False)}"
+                f"{' | validators: ' + vline if vline else ''}"
+                f"{' | ' + vcheck if vcheck else ''}"
+                f"{(f' | conf={conf_val:.2f}/min={conf_min:.2f}') if (isinstance(conf_val,(int,float)) and isinstance(conf_min,(int,float))) else ''}")
     else:
         why = (", ".join(miss)) if miss else "-"
         # NEW: nếu đã có setup kèm DECISION=WAIT -> in gọn setup để trader cân nhắc
@@ -85,9 +91,15 @@ def format_plan(sym: str, plan: dict) -> str:
                     f"entry={_round(entry)} sl={_round(sl)} "
                     f"TP1={_round(tp1)} TP2={_round(tp2)} TP3={_round(tp3)} TP4={_round(tp4)} TP5={_round(tp5)} "
                     f"rr={_round(rr,2)} rr2={_round(rr2,2)} "
-                    f"| reason={why} | confirm:V={conf.get('volume',False)} M={conf.get('momentum',False)} C={conf.get('candles',False)}")
+                    f"| reason={why} | confirm:V={conf.get('volume',False)} M={conf.get('momentum',False)} C={conf.get('candles',False)}"
+                    f"{' | validators: ' + vline if vline else ''}"
+                    f"{' | ' + vcheck if vcheck else ''}"
+                    f"{(f' | conf={conf_val:.2f}/min={conf_min:.2f}') if (isinstance(conf_val,(int,float)) and isinstance(conf_min,(int,float))) else ''}")
         return (f"[{sym}] DECISION={dec} | STATE={state} | DIR={direction} | reason={why} "
-                f"| confirm:V={conf.get('volume',False)} M={conf.get('momentum',False)} C={conf.get('candles',False)}")
+                f"| confirm:V={conf.get('volume',False)} M={conf.get('momentum',False)} C={conf.get('candles',False)}"
+                f"{' | validators: ' + vline if vline else ''}"
+                f"{' | ' + vcheck if vcheck else ''}"
+                f"{(f' | conf={conf_val:.2f}/min={conf_min:.2f}') if (isinstance(conf_val,(int,float)) and isinstance(conf_min,(int,float))) else ''}")
 
 def _round(x, n=0):
     if x is None:
