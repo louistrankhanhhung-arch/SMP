@@ -478,6 +478,13 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
     # Build single unified 'out' (không ghi đè lần 2)
     ev_state = ev.get("state") if isinstance(ev, dict) else None
     ev_dir = ev.get("direction") if isinstance(ev, dict) else None
+    # build validator benchmark strings up front so all return paths can include them
+    try:
+        rep = (ev.get("validator_report") if isinstance(ev, dict) else {}) or {}
+        _validator_line = _build_validator_line(rep)
+        _validator_checklist = _build_checklist(rep)
+    except Exception: _validator_line = ""; _validator_checklist = ""
+      
     out: Dict[str, Any] = {
         "symbol": sym,
         "timeframe_primary": cfg["primary_tf"],
@@ -492,6 +499,12 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
         "missing": [],
         "notes": (ev.get("notes") if isinstance(ev, dict) else []) or [],
         "confirmations": (ev.get("confirmations") if isinstance(ev, dict) else {}) or {},
+        # --- NEW: export for top-level logger (main.py) ---
+        "validator_line": _validator_line,
+        "validator_checklist": _validator_checklist,
+        "confidence": float(ev.get("confidence", 0.0)) if isinstance(ev, dict) else 0.0,
+        "min_conf_enter": float(cfg.get("min_conf_enter", 0.55)),
+        "scores": (ev.get("scores") if isinstance(ev, dict) else {}) or {},
     }
 
     # Quickly filter: if evaluator says SHORT strongly, we still keep LONG-only;
@@ -517,7 +530,7 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
         _debug_dump_validators(out["symbol"], f1d, out.get("confirmations", {}))
         reason = ",".join(out["missing"]) if out.get("missing") else "missing_features"
         notes = "; ".join(out.get("notes", [])) if out.get("notes") else ""
-        # --- PATCH: in thêm benchmark cho validators ---
+        # still log internally; plus we've exported strings above for main.py
         rep = ev.get("validator_report", {})
         bench_line = _build_validator_line(rep)
         checklist  = _build_checklist(rep)
@@ -606,6 +619,9 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
                 except Exception:
                     pass
                 out["notes"].append("setup_on_WAIT: emitted plan for bullish_potential (idea only)")
+            # ensure validator strings present even if no setup emitted
+            out.setdefault("validator_line", _validator_line)
+            out.setdefault("validator_checklist", _validator_checklist)  
 
         reason = ",".join(out["missing"]) if out.get("missing") else "missing_features"
         notes = "; ".join(out.get("notes", [])) if out.get("notes") else ""
