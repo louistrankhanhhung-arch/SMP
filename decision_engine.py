@@ -33,6 +33,7 @@ from __future__ import annotations
 from typing import Dict, Any, Optional, Tuple, List
 import math
 import numpy as np
+import os
 
 # Optional import: we only need evaluate if caller didn't pass evidence
 try:
@@ -162,6 +163,71 @@ DEFAULT_CFG = {
     "relaxed_weekly_required": True,     # weekly phải ủng hộ (stacked_bull hoặc slope>0)
     "relaxed_risk_size_cap": 0.5,        # giảm size tối đa còn 50%
 }
+
+# --- PATCH: optional DEBUG + format helpers ---
+DEBUG_VALIDATORS = bool(int(os.getenv("DEBUG_VALIDATORS", "0")))
+
+def _fmt_val(x, nd=2):
+    try:
+        if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))):
+            return "nan"
+        if isinstance(x, (int, np.integer)):
+            return str(int(x))
+        return f"{float(x):.{nd}f}"
+    except Exception:
+        return "nan"
+
+def _build_validator_line(rep: dict) -> str:
+    """Trả về chuỗi ngắn gọn: V: ... | M: ... | C: ... với actual vs threshold và pass/fail"""
+    if not isinstance(rep, dict):
+        return "V/M/C: n/a"
+    # Volume
+    v = rep.get("volume", {})
+    v_a = v.get("actuals", {}); v_t = v.get("thresholds", {}); v_sc = v.get("sub_criteria", {})
+    v_str = (f"vol_ratio={_fmt_val(v_a.get('vol_ratio'))}>={_fmt_val(v_t.get('vol_ratio_ok'))} "
+             f"({ '✓' if v_sc.get('vol_ratio_ok') else '×' }), "
+             f"z={_fmt_val(v_a.get('vol_z'))}>={_fmt_val(v_t.get('vol_z_ok'))} "
+             f"({ '✓' if v_sc.get('vol_z_ok') else '×' }) → "
+             f"{'PASS' if v.get('passed') else 'FAIL'}")
+    # Momentum
+    m = rep.get("momentum", {})
+    m_a = m.get("actuals", {}); m_t = m.get("thresholds", {}); m_sc = m.get("sub_criteria", {})
+    m_str = (f"ΔMACD={_fmt_val(m_a.get('macd_delta'), 4)}>{_fmt_val(m_t.get('macd_hist_delta_min'), 4)} "
+             f"({ '✓' if m_sc.get('macd_delta_ok') else '×' }), "
+             f"RSI={_fmt_val(m_a.get('rsi'))} vs trig={_fmt_val(m_t.get('rsi_fast_trigger'))} "
+             f"({ '✓' if m_sc.get('rsi_bias_ok') else '×' }) → "
+             f"{'PASS' if m.get('passed') else 'FAIL'}")
+    # Candles
+    c = rep.get("candles", {})
+    c_a = c.get("actuals", {}); c_t = c.get("thresholds", {}); c_sc = c.get("sub_criteria", {})
+    # hiển thị range/ATR theo dạng k*ATR
+    rng = c_a.get("range"); atr = c_a.get("atr14")
+    k = (rng/atr) if (isinstance(rng,(int,float)) and isinstance(atr,(int,float)) and atr not in (0, np.nan)) else np.nan
+    c_str = (f"range={_fmt_val(rng)} ≈ {_fmt_val(k)}*ATR (min={_fmt_val(c_t.get('atr_push_min'))}) "
+             f"({ '✓' if c_sc.get('push_ok') else '×' }), "
+             f"body={_fmt_val(c_a.get('body_pct'))}>={_fmt_val(c_t.get('body_pct_ok'))} "
+             f"({ '✓' if c_sc.get('body_ok') else '×' }) → "
+             f"{'PASS' if c.get('passed') else 'FAIL'}")
+    return f"V: {v_str} | M: {m_str} | C: {c_str}"
+
+def _build_checklist(rep: dict) -> str:
+    """Checklist tiêu chí đã ĐẠT/CHƯA ở từng nhánh — dùng icon ✓/×, ngắn gọn."""
+    if not isinstance(rep, dict):
+        return ""
+    items = []
+    v_sc = rep.get("volume", {}).get("sub_criteria", {})
+    items.append(("vol_ratio_ok", v_sc.get("vol_ratio_ok", False)))
+    items.append(("vol_z_ok", v_sc.get("vol_z_ok", False)))
+    m_sc = rep.get("momentum", {}).get("sub_criteria", {})
+    items.append(("macd_delta_ok", m_sc.get("macd_delta_ok", False)))
+    items.append(("rsi_bias_ok", m_sc.get("rsi_bias_ok", False)))
+    c_sc = rep.get("candles", {}).get("sub_criteria", {})
+    items.append(("push_ok", c_sc.get("push_ok", False)))
+    items.append(("body_ok", c_sc.get("body_ok", False)))
+    met   = [k for k, ok in items if ok]
+    miss  = [k for k, ok in items if not ok]
+    return f"met={met} | missing={miss}"
+
 
 # =========================
 # Small helpers
@@ -451,9 +517,14 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
         _debug_dump_validators(out["symbol"], f1d, out.get("confirmations", {}))
         reason = ",".join(out["missing"]) if out.get("missing") else "missing_features"
         notes = "; ".join(out.get("notes", [])) if out.get("notes") else ""
+        # --- PATCH: in thêm benchmark cho validators ---
+        rep = ev.get("validator_report", {})
+        bench_line = _build_validator_line(rep)
+        checklist  = _build_checklist(rep)
         log_info(
             f"[{out['symbol']}] DECISION=WAIT | STATE={out.get('STATE')} | DIR={out.get('DIRECTION')} | "
-            f"reason={reason} | confirm:V={V_ok} M={M_ok} C={C_ok} | notes={notes} | missing={list(out['missing'])}"
+            f"reason={reason} | confirm:V={V_ok} M={M_ok} C={C_ok} | {bench_line} | {checklist} | "
+            f"notes={notes} | missing={list(out['missing'])}"
         )
         return out
 
@@ -499,6 +570,12 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
         M_ok = bool(_conf.get("momentum", False))
         C_ok = bool(_conf.get("candles", False))
         out["confirm"] = {"V": V_ok, "M": M_ok, "C": C_ok}
+        # Khi có setup (WAIT/SETUP), vẫn in benchmark để bạn theo dõi
+        if DEBUG_VALIDATORS:
+            rep = ev.get("validator_report", {})
+            bench_line = _build_validator_line(rep)
+            checklist  = _build_checklist(rep)
+            log_info(f"[{out['symbol']}] VALIDATORS | {bench_line} | {checklist}")
         _debug_dump_validators(out["symbol"], f1d, out.get("confirmations", {}))
 
         # NEW: vẫn phát hành setup khi WAIT nếu state được cho phép
