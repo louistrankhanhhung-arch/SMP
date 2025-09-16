@@ -214,6 +214,14 @@ def _pullback_to_ema(df1d: pd.DataFrame, f1d: dict, cfg: dict) -> Tuple[float, s
         try:
             prev_row = df1d.iloc[-2]
             vr_prev = float(prev_row.get('vol_ratio', np.nan))
+            if np.isnan(vr_prev):
+                try:
+                    prev_vol = float(prev_row.get('volume', np.nan))
+                    prev_ma20 = float(prev_row.get('vol_ma20', np.nan))
+                    if prev_ma20 and prev_ma20 > 0:
+                        vr_prev = prev_vol / prev_ma20
+                except Exception:
+                    pass
         except Exception:
             pass
     body  = _get(f1d, 'body_pct', np.nan); tail = _get(f1d, 'lower_tail_ratio', np.nan)
