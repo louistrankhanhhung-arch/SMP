@@ -28,8 +28,11 @@ from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from indicators import enrich_indicators
+VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
 # --- robust coerce helper ---
 def _ensure_series(x):
@@ -85,8 +88,19 @@ def _zscore(series: pd.Series, window: int = 20) -> pd.Series:
 # =========================
 # Core feature derivation
 # =========================
+def _last_closed_idx(enriched: pd.DataFrame) -> int:
+    try:
+        ts = enriched["ts"].iloc[-1]
+        now = datetime.now(VN_TZ)
+        if hasattr(ts, "date") and ts.date() == now.date() and now.hour < 15 and len(enriched) >= 2:
+            return -2
+    except Exception:
+        pass
+    return -1
+
 def _derive_features(enriched: pd.DataFrame, timeframe: str) -> dict:
-    last = enriched.iloc[-1]
+    # NEW: snapshot trên nến đã chốt (nếu đang trong phiên)
+    last = enriched.iloc[_last_closed_idx(enriched)]
     # Trend structure
     close = last["close"]
     ema20, ema50, ema200 = last["ema20"], last["ema50"], last["ema200"]
@@ -133,10 +147,14 @@ def _derive_features(enriched: pd.DataFrame, timeframe: str) -> dict:
     macd_bias = "bull" if macd_hist > 0 else ("bear" if macd_hist < 0 else "flat")
     stoch_cross = "k>dx" if st_k > st_d else ("k<dx" if st_k < st_d else "flat")
 
-    # Volume features: volume vs 20-day average, zscore
-    vol_ma20 = float(enriched["volume"].rolling(20).mean().iloc[-1]) if "volume" in enriched.columns else np.nan
-    vol_ratio = float(vol / vol_ma20) if vol_ma20 and vol_ma20 > 0 else np.nan
-    vol_z = float(_zscore(enriched["volume"], 20).iloc[-1]) if "volume" in enriched.columns else np.nan
+    # Volume features: dùng thống kê dựa trên bar đã chốt (shift(1))
+    if "volume" in enriched.columns:
+        vol_ma20_series = enriched["volume"].shift(1).rolling(20).mean()
+        vol_ma20 = float(vol_ma20_series.iloc[-1])
+        vol_ratio = float(vol / vol_ma20) if vol_ma20 and vol_ma20 > 0 else np.nan
+        vol_z = float(_zscore(enriched["volume"].shift(1), 20).iloc[-1])
+    else:
+        vol_ma20, vol_ratio, vol_z = np.nan, np.nan, np.nan
 
     # Support/Resistance using rolling pivots & recent extrema
     hi20 = float(_rolling_extrema(enriched["high"], 20, "high").iloc[-1])
@@ -165,6 +183,7 @@ def _derive_features(enriched: pd.DataFrame, timeframe: str) -> dict:
         "rsi14": float(rsi14), "rsi_zone": rsi_zone,
         "macd_hist": float(macd_hist), "macd_bias": macd_bias,
         "stoch_k": float(st_k), "stoch_d": float(st_d), "stoch_cross": stoch_cross,
+        # ATR đã được tính trong enrich_indicators; giả định trên bar chốt
         "atr14": float(atr14), "atr_pct": float(atr_pct),
         "ema20_slope5": ema20_slope5, "ema50_slope5": ema50_slope5, "ema200_slope5": ema200_slope5,
         "stacked_bull": bool(stacked_bull), "stacked_bear": bool(stacked_bear),
