@@ -97,6 +97,7 @@ def format_plan(sym: str, plan: dict) -> str:
                 f"{' | ' + vcheck if vcheck else ''}"
                 f"{(f' | conf={conf_val:.2f}/min={conf_min:.2f}') if (isinstance(conf_val,(int,float)) and isinstance(conf_min,(int,float))) else ''}"
                 f"{' | DATA_GAP: ' + ','.join(map(str,data_issues)) if (data_ok is False) else ''}"
+                )
     else:
         why = (", ".join(miss)) if miss else "-"
         # NEW: nếu đã có setup kèm DECISION=WAIT -> in gọn setup để trader cân nhắc
