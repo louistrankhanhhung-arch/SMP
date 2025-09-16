@@ -10,11 +10,199 @@ vnstock_api.py — Data access layer for Vietnam equities (VN30/HOSE/HNX/UPCoM)
 - Tries interval aliases: 1D→["1D","1d","D","day","daily"], 1W→["1W","1w","W","week","weekly"]
 """
 from __future__ import annotations
-from typing import List, Dict, Tuple
+import os
+import numpy as np
+from typing import List, Dict, Tuple, Optional
 import pandas as pd
 import importlib
 from datetime import datetime, timedelta, timezone
 
+try:
+    import pytz
+except Exception:
+    pytz = None
+
+# Nếu bạn đang dùng một SDK nào đó (vd vnstock3/ssi/…) để fetch dữ liệu,
+# bạn vẫn gọi như cũ ở dưới. Patch này tập trung vào làm sạch & chuẩn hóa.
+
+VN_TZ_NAME = "Asia/Ho_Chi_Minh"
+MARKET_CLOSE_HOUR = int(os.getenv("MARKET_CLOSE_HOUR", "15"))  # 15:00 VN
+DROP_RUNNING_CANDLE = bool(int(os.getenv("DROP_RUNNING_CANDLE", "1")))  # mặc định bỏ nến chưa chốt
+MIN_ROWS_REQUIRED = int(os.getenv("MIN_ROWS_REQUIRED", "25"))  # đủ cho rolling 20 + margin
+
+def _get_tz():
+    if pytz is None:
+        return None
+    try:
+        return pytz.timezone(VN_TZ_NAME)
+    except Exception:
+        return None
+
+def _to_vn_tz(dt: pd.Series | pd.DatetimeIndex) -> pd.DatetimeIndex:
+    tz = _get_tz()
+    if isinstance(dt, pd.Series):
+        idx = pd.to_datetime(dt, errors="coerce", utc=True)
+    else:
+        idx = pd.to_datetime(dt, errors="coerce", utc=True)
+    if tz is not None:
+        try:
+            return idx.tz_convert(tz)
+        except Exception:
+            try:
+                # nếu dữ liệu local-naive, gán tz VN
+                return idx.tz_localize(tz, nonexistent="shift_forward", ambiguous="NaT")
+            except Exception:
+                return idx
+    return idx
+
+def _coerce_numeric(s: pd.Series) -> pd.Series:
+    # xóa dấu phẩy/ngăn cách nghìn nếu có, sau đó ép kiểu số
+    if s.dtype == object:
+        s = s.astype(str).str.replace(",", "", regex=False).str.replace("_", "", regex=False)
+    out = pd.to_numeric(s, errors="coerce")
+    # volume âm/close âm => NaN
+    out = out.mask(~np.isfinite(out))
+    return out
+
+def _sanitize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=["time","open","high","low","close","volume"])
+    # Chuẩn tên cột phổ biến
+    cols_map = {
+        "date": "time", "time": "time", "datetime": "time",
+        "o": "open", "open": "open",
+        "h": "high", "high": "high",
+        "l": "low", "low": "low",
+        "c": "close", "close": "close", "adj_close": "close",
+        "v": "volume", "volume": "volume", "vol": "volume",
+    }
+    # Đổi tên cột theo map nếu phù hợp
+    renamed = {}
+    for c in df.columns:
+        key = c.lower().strip()
+        renamed[c] = cols_map.get(key, c)
+    df = df.rename(columns=renamed)
+
+    # Chỉ giữ các cột cốt lõi
+    keep = [c for c in ["time","open","high","low","close","volume"] if c in df.columns]
+    df = df[keep].copy()
+
+    # Chuẩn hóa thời gian về VN timezone
+    if "time" in df.columns:
+        df["time"] = _to_vn_tz(df["time"])
+    else:
+        # thiếu trầm trọng: trả khung rỗng đúng schema
+        return pd.DataFrame(columns=["time","open","high","low","close","volume"])
+
+    # Ép số cho OHLCV
+    for c in ["open","high","low","close","volume"]:
+        if c in df.columns:
+            df[c] = _coerce_numeric(df[c])
+        else:
+            df[c] = np.nan
+
+    # Bỏ dòng thiếu toàn bộ OHLC
+    df = df.dropna(subset=["open","high","low","close"], how="any")
+
+    # Dedupe + sort theo time
+    df = df.drop_duplicates(subset=["time"]).sort_values("time")
+    df = df.reset_index(drop=True)
+
+    # Đảm bảo DataFrame có đúng cột & thứ tự
+    df = df[["time","open","high","low","close","volume"]]
+    return df
+
+def _drop_running_candle_if_needed(df: pd.DataFrame) -> pd.DataFrame:
+    """Bỏ nến ngày hiện tại nếu chưa qua giờ đóng cửa (15:00 VN)."""
+    if not DROP_RUNNING_CANDLE:
+        return df
+    if df is None or len(df) == 0:
+        return df
+    tz = _get_tz()
+    now = datetime.now(tz) if tz else datetime.now()
+    # Lấy dòng cuối cùng
+    last = df.iloc[-1]
+    ts: pd.Timestamp = last["time"]
+    if pd.isna(ts):
+        return df
+    try:
+        ts_local = ts
+        # Nếu ts không có tz, coi như local VN
+        if ts_local.tzinfo is None and tz is not None:
+            ts_local = ts_local.tz_localize(tz, nonexistent="shift_forward", ambiguous="NaT")
+    except Exception:
+        ts_local = ts
+    if ts_local.date() == now.date():
+        # trước 15:00 thì xóa nến hôm nay
+        if now.time() < dtime(hour=MARKET_CLOSE_HOUR, minute=0):
+            return df.iloc[:-1].copy()
+    return df
+
+def _quality_report(df: pd.DataFrame) -> dict:
+    issues = []
+    ok = True
+    need = ["time","open","high","low","close","volume"]
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return {"ok": False, "issues": ["df_empty"]}
+    missing = [c for c in need if c not in df.columns]
+    if missing:
+        issues.append(f"missing_cols:{missing}")
+        ok = False
+    if len(df) < MIN_ROWS_REQUIRED:
+        issues.append(f"rows_lt_{MIN_ROWS_REQUIRED}({len(df)})")
+        ok = False
+    # kiểm tra NaN bất thường
+    nan_ohlc = df[["open","high","low","close"]].isna().sum().sum()
+    if nan_ohlc > 0:
+        issues.append(f"nan_ohlc:{int(nan_ohlc)}")
+        ok = False
+    return {"ok": ok, "issues": issues}
+
+def fetch_ohlcv_1d(symbol: str, start: Optional[str] = None, end: Optional[str] = None) -> pd.DataFrame:
+    """
+    Trả về OHLCV 1D đã CHUẨN HÓA:
+    - Columns: time (tz=Asia/Ho_Chi_Minh), open, high, low, close, volume
+    - Bỏ nến đang chạy (hôm nay, trước 15:00) nếu DROP_RUNNING_CANDLE=1
+    - Dữ liệu đã ép kiểu số, dedupe, sort.
+    """
+    # 1) FETCH từ nguồn gốc của bạn
+    # TODO: thay thế bằng hàm fetch gốc (vd từ vnstock/vietstock/ssi/…)
+    # Ví dụ giả lập (để tránh vỡ code nếu nguồn rỗng):
+    try:
+        # df_raw = provider.fetch_daily(symbol, start=start, end=end)
+        df_raw = None  # <-- thay bằng lệnh thực tế của bạn
+    except Exception as e:
+        print(f"[{symbol}] fetch error: {e}")
+        df_raw = None
+
+    # 2) Sanitize
+    df = _sanitize_ohlcv(df_raw if df_raw is not None else pd.DataFrame())
+    # 3) Drop nến đang chạy nếu cần
+    df = _drop_running_candle_if_needed(df)
+
+    # 4) Kiểm tra chất lượng để log sớm — giúp phân biệt DATA GAP vs fail tiêu chí
+    q = _quality_report(df)
+    if not q["ok"]:
+        print(f"[{symbol}] DATA_GAP -> {q['issues']}")
+    return df
+
+def fetch_symbols_daily(symbols: list[str], start: Optional[str] = None, end: Optional[str] = None) -> dict[str, pd.DataFrame]:
+    """
+    Helper: fetch nhiều mã một lần với chuẩn hóa giống nhau.
+    Trả về dict {symbol: df_ohlcv}
+    """
+    out = {}
+    for sym in symbols:
+        try:
+            out[sym] = fetch_ohlcv_1d(sym, start=start, end=end)
+        except Exception as e:
+            print(f"[{sym}] fetch failed: {e}")
+            out[sym] = pd.DataFrame(columns=["time","open","high","low","close","volume"])
+    return out
+
+# Nếu code cũ của bạn có hàm get_ohlcv hay tương tự, bạn có thể alias:
+# get_ohlcv = fetch_ohlcv_1d
+    
 _TZ = "Asia/Ho_Chi_Minh"
 _SUPPORTED_SOURCES = ["VCI", "TCBS", "MSN"]
 _INTERVAL_ALIASES = {
