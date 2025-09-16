@@ -37,6 +37,19 @@ from typing import Dict, Any, Tuple, List
 import math
 import numpy as np
 import pandas as pd
+from datetime import datetime
+from zoneinfo import ZoneInfo
+VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+
+def _last_closed_idx_df(df: pd.DataFrame) -> int:
+    try:
+        ts = df["ts"].iloc[-1]
+        now = datetime.now(VN_TZ)
+        if hasattr(ts, "date") and ts.date() == now.date() and now.hour < 15 and len(df) >= 2:
+            return -2
+    except Exception:
+        pass
+    return -1
 
 # =========================
 # Default configuration
@@ -106,7 +119,8 @@ def _momentum_ok(f1d: dict, prev1d: dict | None, cfg: dict) -> bool:
 def _candles_ok(df1d: pd.DataFrame, f1d: dict, cfg: dict) -> bool:
     if df1d is None or len(df1d) < 1:
         return False
-    row = df1d.iloc[-1]
+    # NEW: dùng nến đã chốt
+    row = df1d.iloc[_last_closed_idx_df(df1d)]
     rng = float(row.get('range', np.nan))
     atr14 = float(row.get('atr14', np.nan))
     body_pct = float(row.get('body_pct', np.nan))
@@ -115,8 +129,9 @@ def _candles_ok(df1d: pd.DataFrame, f1d: dict, cfg: dict) -> bool:
     return bool(ok_push or ok_body)
 
 def _or_validation(df1d: pd.DataFrame, f1d: dict, prev1d: dict | None, cfg: dict) -> Tuple[bool, dict]:
-    vol_ok = _volume_ok(f1d, cfg)
-    mom_ok = _momentum_ok(f1d, prev1d, cfg)
+    # NEW: all confirmations evaluated on CLOSED bar snapshot
+    vol_ok = _volume_ok(f1d, cfg)       # f1d đã là snapshot đóng nến từ feature_primitives
+    mom_ok = _momentum_ok(f1d, prev1d, cfg)  # prev1d cũng lấy từ bar trước đóng
     candle_ok = _candles_ok(df1d, f1d, cfg)
     # OR gate: (Volume) OR (Momentum OR Candles)
     valid = bool(vol_ok or mom_ok or candle_ok)
@@ -270,10 +285,10 @@ def evaluate(features_by_tf: Dict[str, dict], *, cfg: dict | None = None) -> dic
 
     df1d = d1.get('df', None)
     f1d = d1.get('features', {}) or {}
-    # previous bar features (if available)
+    # previous bar features (if available) — ensure prev is also CLOSED bar
     prev1d = {}
     if df1d is not None and len(df1d) >= 2:
-        prev_row = df1d.iloc[-2]
+        prev_row = df1d.iloc[_last_closed_idx_df(df1d) - 1] if len(df1d) >= 3 else df1d.iloc[-2]
         prev1d = {
             'close': float(prev_row.get('close', np.nan)),
             'ema20': float(prev_row.get('ema20', np.nan)),
