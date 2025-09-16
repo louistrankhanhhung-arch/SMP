@@ -128,6 +128,61 @@ def _candles_ok(df1d: pd.DataFrame, f1d: dict, cfg: dict) -> bool:
     ok_body = (not np.isnan(body_pct) and body_pct >= cfg['body_pct_ok'])
     return bool(ok_push or ok_body)
 
+def _validator_benchmarks(df1d: pd.DataFrame, f1d: dict, prev1d: dict | None, cfg: dict) -> dict:
+    """Trả về báo cáo chi tiết cho từng nhánh: volume / momentum / candles
+       gồm: passed, actuals, thresholds, sub_criteria (đã đạt/chưa đạt).
+    """
+    # --- Volume ---
+    vol_ratio = float(_get(f1d, 'vol_ratio', np.nan))
+    vol_z     = float(_get(f1d, 'vol_z', np.nan))
+    vr_ok     = (not np.isnan(vol_ratio)) and (vol_ratio >= cfg.get('vol_ratio_ok', 1.2))
+    vz_ok     = (not np.isnan(vol_z)) and (vol_z >= cfg.get('vol_z_ok', 0.5))
+    vol_pass  = bool(vr_ok or vz_ok)
+
+    # --- Momentum ---
+    macd_now  = float(_get(f1d, 'macd_hist', np.nan))
+    rsi_now   = float(_get(f1d, 'rsi14', np.nan))
+    macd_prev = float(_get(prev1d, 'macd_hist', np.nan)) if prev1d else float('nan')
+    macd_delta = (macd_now - macd_prev) if (not np.isnan(macd_now) and not np.isnan(macd_prev)) else np.nan
+    md_ok     = (not np.isnan(macd_delta)) and (macd_delta > cfg.get('macd_hist_delta_min', 0.0))
+    rsi_trig  = cfg.get('rsi_fast_trigger', 55.0)
+    rsi_ok    = (not np.isnan(rsi_now)) and (rsi_now >= rsi_trig or rsi_now <= (100.0 - rsi_trig))
+    mom_pass  = bool(md_ok or rsi_ok)
+
+    # --- Candles (dựa trên bar đã chốt) ---
+    row_idx   = _last_closed_idx_df(df1d)
+    row       = df1d.iloc[row_idx]
+    rng       = float(row.get('range', np.nan))
+    atr14     = float(row.get('atr14', np.nan))
+    body_pct  = float(row.get('body_pct', np.nan))
+    atr_mult  = cfg.get('atr_push_min', 0.6)
+    body_min  = cfg.get('body_pct_ok', 0.35)
+    push_ok   = (not np.isnan(rng) and not np.isnan(atr14) and rng >= atr_mult * atr14)
+    body_ok   = (not np.isnan(body_pct) and body_pct >= body_min)
+    candle_pass = bool(push_ok or body_ok)
+
+    report = {
+        "volume": {
+            "passed": vol_pass,
+            "actuals": {"vol_ratio": vol_ratio, "vol_z": vol_z},
+            "thresholds": {"vol_ratio_ok": cfg.get('vol_ratio_ok', 1.2), "vol_z_ok": cfg.get('vol_z_ok', 0.5)},
+            "sub_criteria": {"vol_ratio_ok": vr_ok, "vol_z_ok": vz_ok}
+        },
+        "momentum": {
+            "passed": mom_pass,
+            "actuals": {"macd_now": macd_now, "macd_prev": macd_prev, "macd_delta": macd_delta, "rsi": rsi_now},
+            "thresholds": {"macd_hist_delta_min": cfg.get('macd_hist_delta_min', 0.0), "rsi_fast_trigger": rsi_trig},
+            "sub_criteria": {"macd_delta_ok": md_ok, "rsi_bias_ok": rsi_ok}
+        },
+        "candles": {
+            "passed": candle_pass,
+            "actuals": {"range": rng, "atr14": atr14, "body_pct": body_pct, "atr_mult": atr_mult},
+            "thresholds": {"atr_push_min": atr_mult, "body_pct_ok": body_min},
+            "sub_criteria": {"push_ok": push_ok, "body_ok": body_ok}
+        }
+    }
+    return report
+
 def _or_validation(df1d: pd.DataFrame, f1d: dict, prev1d: dict | None, cfg: dict) -> Tuple[bool, dict]:
     # NEW: all confirmations evaluated on CLOSED bar snapshot
     vol_ok = _volume_ok(f1d, cfg)       # f1d đã là snapshot đóng nến từ feature_primitives
@@ -319,6 +374,7 @@ def evaluate(features_by_tf: Dict[str, dict], *, cfg: dict | None = None) -> dic
 
     # Validators (Volume OR Momentum/Candles)
     valid, validators = _or_validation(df1d, f1d, prev1d, cfg)
+    validator_report  = _validator_benchmarks(df1d, f1d, prev1d, cfg)
 
     # Pick best state
     best_state = None
@@ -336,6 +392,7 @@ def evaluate(features_by_tf: Dict[str, dict], *, cfg: dict | None = None) -> dic
         'confidence': conf,
         'scores': scores,
         'confirmations': validators,
+        "validator_report": validator_report,
         'notes': notes,
         'by_tf': {
             '1D': {'features': f1d, 'n': int(len(df1d)) if df1d is not None else 0},
