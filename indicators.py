@@ -29,8 +29,13 @@ def _safe_div(a, b):
         return res
 
 def _ensure_sorted(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return df
+    df = df.copy()
+    # Ưu tiên ts; nếu chưa có mà có 'time' thì sinh ts từ time
+    if "ts" not in df.columns and "time" in df.columns:
+        df["ts"] = pd.to_datetime(df["time"], errors="coerce")
     if "ts" in df.columns:
-        df = df.copy()
         if not pd.api.types.is_datetime64_any_dtype(df["ts"]):
             df["ts"] = pd.to_datetime(df["ts"], errors="coerce", utc=True)
         df = df.sort_values("ts").reset_index(drop=True)
