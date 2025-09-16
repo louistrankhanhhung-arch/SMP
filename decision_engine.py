@@ -121,6 +121,18 @@ DEFAULT_CFG = {
     "max_dist_ema20_pct_for_reclaim": 6.0,
     # Emit setup even if DECISION=WAIT for these states
     "emit_plan_on_wait_states": ["bullish_potential"],
+    # -----------------------------
+    # RELAXED MODE (with guardrails)
+    # -----------------------------
+    "relaxed_enabled": True,
+    # chỉ cho một số state được nới:
+    "relaxed_allowed_states": ["bullish_potential", "pullback_to_ema", "reclaim"],
+    # rào chắn:
+    "relaxed_min_rr": 1.5,               # RR tới TP1 tối thiểu
+    "relaxed_max_dist_ema20": 6.0,       # % cách EMA20 tối đa
+    "relaxed_max_pctb": 0.90,            # tránh overextension sát BBupper
+    "relaxed_weekly_required": True,     # weekly phải ủng hộ (stacked_bull hoặc slope>0)
+    "relaxed_risk_size_cap": 0.5,        # giảm size tối đa còn 50%
 }
 
 # =========================
@@ -418,6 +430,40 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
 
     # 2) Có feature: cho _should_enter_long tự append các khóa thiếu vào out["missing"]
     can_enter = _should_enter_long((ev or {}), f1d, cfg or {}, out["missing"])
+    # -----------------------------
+    # RELAXED MODE (nếu gate fail)
+    # -----------------------------
+    if not can_enter and cfg.get("relaxed_enabled", True):
+        st_lower = (out.get("STATE") or "").lower()
+        if st_lower in set(cfg.get("relaxed_allowed_states", [])):
+            # guardrails 1D/1W
+            w1 = features_by_tf.get("1W", {}) or {}
+            f1w = (w1.get("features") or {})
+            close = float(_get(f1d, "close", float("nan")))
+            ema20 = float(_get(f1d, "ema20", float("nan")))
+            pctb  = float(_get(f1d, "bb_pctb", float("nan")))
+            dist20 = abs(_pct(close, ema20))
+            weekly_ok = True
+            if cfg.get("relaxed_weekly_required", True):
+                weekly_ok = bool(f1w.get("stacked_bull", False) or float(f1w.get("ema20_slope5", 0.0)) > 0.0)
+            near_ema = (not np.isnan(dist20)) and (dist20 <= cfg.get("relaxed_max_dist_ema20", 6.0))
+            not_overext = (not np.isnan(pctb)) and (pctb <= cfg.get("relaxed_max_pctb", 0.90))
+            # preview kế hoạch để kiểm tra RR
+            try:
+                _entry, _entry2, _sl, _tps, _rsh, _notes = _plan_by_state(out["STATE"], f1d, (ev or {}), cfg)
+                R = (_entry - _sl) if (_sl is not None) else float("nan")
+                rr1 = ((_tps[0] - _entry) / R) if (R and R > 0) else float("nan")
+            except Exception:
+                rr1 = float("nan")
+            rr_ok = (not np.isnan(rr1)) and (rr1 >= cfg.get("relaxed_min_rr", 1.5))
+            relaxed_ok = bool(weekly_ok and near_ema and not_overext and rr_ok)
+            if relaxed_ok:
+                # bật cờ relaxed, cho phép vào lệnh tiếp tục theo flow chuẩn bên dưới
+                out["notes"].append("validators_relaxed: weekly_ok & near_ema20 & not_overext & rr_ok")
+                # đánh dấu để hạ size sau khi build plan
+                out["__relaxed_pass__"] = True
+                can_enter = True
+
     if not can_enter:
         _conf = out["confirmations"]
         V_ok = bool(_conf.get("volume", False))
@@ -471,7 +517,16 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
 
     # State-aware planning (flexible entries)
     entry, entry2, sl, tps, rsh, extra_notes = _plan_by_state(out["STATE"], f1d, ev or {}, cfg)
-
+    # Nếu pass nhờ RELAXED → giảm size + đảm bảo có entry2 kiểu pullback
+    if out.pop("__relaxed_pass__", False):
+        try:
+            rsh = float(min(rsh or 1.0, cfg.get("relaxed_risk_size_cap", 0.5)))
+            atr14 = _get(f1d, "atr14", np.nan)
+            if entry2 is None and not np.isnan(atr14):
+                entry2 = float(entry - 0.5 * atr14)  # ép có thang add ở -0.5*ATR
+            out["notes"].append("relaxed_mode: cap size to 50% and prefer add @ -0.5*ATR")
+        except Exception:
+            pass
     if sl >= entry:  # safety
         sl = entry * (1.0 - cfg["sl_min_pct"]/100.0)
 
