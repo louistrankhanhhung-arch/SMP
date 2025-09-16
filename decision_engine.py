@@ -65,12 +65,12 @@ except Exception:
 # --- end shim ---
 
 # --- DEBUG VALIDATORS FLAG ---
-+try:
-+    import os
-+    DEBUG_VALIDATORS = bool(int(os.getenv("DEBUG_VALIDATORS", "0")))
-+except Exception:
-+    DEBUG_VALIDATORS = False
-+
+try:
+    import os
+    DEBUG_VALIDATORS = bool(int(os.getenv("DEBUG_VALIDATORS", "0")))
+except Exception:
+    DEBUG_VALIDATORS = False
+
 def _debug_dump_validators(symbol: str, f1d: dict, confirmations: dict):
     if not DEBUG_VALIDATORS:
         return
