@@ -4,7 +4,7 @@ vnstock_api.py — Data access layer for Vietnam equities (VN30/HOSE/HNX/UPCoM)
 ----------------------------------------------------------------------------
 - Uses unified `vnstock` package (>=3.2.x).
 - Fetch OHLCV for 1D & 1W; includes the *running* candle when include_partial=True.
-- Normalized columns: ["ts","open","high","low","close","volume"]
+- Normalized columns: ["time","open","high","low","close","volume"]
 - Tries multiple sources if a provider returns empty/error: ["VCI","TCBS","MSN"]
 - Tries symbol variants: "VCB", "VCB.HOSE", "VCB:HOSE"
 - Tries interval aliases: 1D→["1D","1d","D","day","daily"], 1W→["1W","1w","W","week","weekly"]
@@ -158,47 +158,16 @@ def _quality_report(df: pd.DataFrame) -> dict:
         ok = False
     return {"ok": ok, "issues": issues}
 
+# ---- Backward-compatible aliases (single unified flow) --------------------
+# Nếu code cũ của bạn import các hàm dưới đây, chúng sẽ chuyển về fetch_ohlcv/Batch.
 def fetch_ohlcv_1d(symbol: str, start: Optional[str] = None, end: Optional[str] = None) -> pd.DataFrame:
-    """
-    Trả về OHLCV 1D đã CHUẨN HÓA:
-    - Columns: time (tz=Asia/Ho_Chi_Minh), open, high, low, close, volume
-    - Bỏ nến đang chạy (hôm nay, trước 15:00) nếu DROP_RUNNING_CANDLE=1
-    - Dữ liệu đã ép kiểu số, dedupe, sort.
-    """
-    # 1) FETCH từ nguồn gốc của bạn
-    # TODO: thay thế bằng hàm fetch gốc (vd từ vnstock/vietstock/ssi/…)
-    # Ví dụ giả lập (để tránh vỡ code nếu nguồn rỗng):
-    try:
-        # df_raw = provider.fetch_daily(symbol, start=start, end=end)
-        df_raw = None  # <-- thay bằng lệnh thực tế của bạn
-    except Exception as e:
-        print(f"[{symbol}] fetch error: {e}")
-        df_raw = None
-
-    # 2) Sanitize
-    df = _sanitize_ohlcv(df_raw if df_raw is not None else pd.DataFrame())
-    # 3) Drop nến đang chạy nếu cần
-    df = _drop_running_candle_if_needed(df)
-
-    # 4) Kiểm tra chất lượng để log sớm — giúp phân biệt DATA GAP vs fail tiêu chí
-    q = _quality_report(df)
-    if not q["ok"]:
-        print(f"[{symbol}] DATA_GAP -> {q['issues']}")
+    """Alias: unified path via vnstock, timeframe=1D."""
+    df = fetch_ohlcv(symbol, timeframe="1D", limit=600, include_partial=True)
     return df
 
 def fetch_symbols_daily(symbols: list[str], start: Optional[str] = None, end: Optional[str] = None) -> dict[str, pd.DataFrame]:
-    """
-    Helper: fetch nhiều mã một lần với chuẩn hóa giống nhau.
-    Trả về dict {symbol: df_ohlcv}
-    """
-    out = {}
-    for sym in symbols:
-        try:
-            out[sym] = fetch_ohlcv_1d(sym, start=start, end=end)
-        except Exception as e:
-            print(f"[{sym}] fetch failed: {e}")
-            out[sym] = pd.DataFrame(columns=["time","open","high","low","close","volume"])
-    return out
+    """Alias: unified batch with timeframe=1D."""
+    return fetch_ohlcv_batch(symbols, timeframe="1D", limit=600, include_partial=True)
 
 # Nếu code cũ của bạn có hàm get_ohlcv hay tương tự, bạn có thể alias:
 # get_ohlcv = fetch_ohlcv_1d
@@ -286,7 +255,7 @@ def _history_with_fallbacks(obj, start: str, end: str, tf: str):
         except Exception as e:
             tried.append(f"{itv}(nodates):err={e}")
             continue
-    return pd.DataFrame(columns=["ts","open","high","low","close","volume"]), {"tried": tried}
+    return pd.DataFrame(columns=["time","open","high","low","close","volume"]), {"tried": tried}
 
 def _drop_running_bar_if_needed(df: pd.DataFrame, timeframe: str, include_partial: bool) -> pd.DataFrame:
     if include_partial or len(df) == 0:
