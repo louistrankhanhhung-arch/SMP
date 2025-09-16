@@ -421,3 +421,94 @@ if __name__ == "__main__":
         print("Self-test OK:", out['state'], out['direction'], round(out['confidence'],3))
     except Exception as e:
         print("Self-test failed:", e)
+
+def _coalesce(x, default):
+    try:
+        if x is None: return default
+        if isinstance(x, float) and (np.isnan(x) or np.isinf(x)): return default
+        return x
+    except Exception:
+        return default
+
+def _has_cols(df: pd.DataFrame, cols: list[str]) -> bool:
+    return all(c in df.columns for c in cols)
+
+def _validator_benchmarks(df1d: pd.DataFrame, f1d: dict, prev1d: dict | None, cfg: dict) -> dict:
+    """Report chi tiết + phát hiện DATA_GAP."""
+    rep = {"data_ok": True, "data_issues": []}
+    need_cols = ["close","volume","atr14","range","body_pct","rsi14","macd_hist"]
+    if not isinstance(df1d, pd.DataFrame) or len(df1d) < 25 or not _has_cols(df1d, need_cols):
+        rep["data_ok"] = False
+        if not isinstance(df1d, pd.DataFrame): rep["data_issues"].append("df1d_none")
+        elif len(df1d) < 25: rep["data_issues"].append(f"rows_lt_25({len(df1d)})")
+        missing = [c for c in need_cols if c not in getattr(df1d, "columns", [])]
+        if missing: rep["data_issues"].append(f"missing_cols:{missing}")
+
+    # --- thresholds (coalesce) ---
+    vol_ratio_ok = float(_coalesce(cfg.get('vol_ratio_ok'), 1.2))
+    vol_z_ok     = float(_coalesce(cfg.get('vol_z_ok'), 0.5))
+    macd_hist_delta_min = float(_coalesce(cfg.get('macd_hist_delta_min'), 0.0))
+    rsi_fast_trigger    = float(_coalesce(cfg.get('rsi_fast_trigger'), 55.0))
+    atr_push_min        = float(_coalesce(cfg.get('atr_push_min'), 0.6))
+    body_pct_ok         = float(_coalesce(cfg.get('body_pct_ok'), 0.35))
+
+    # --- actuals ---
+    def _g(d, k):
+        v = (d or {}).get(k, np.nan)
+        try: return float(v)
+        except Exception: return np.nan
+
+    vol_ratio = _g(f1d, 'vol_ratio')
+    vol_z     = _g(f1d, 'vol_z')
+    macd_now  = _g(f1d, 'macd_hist')
+    rsi_now   = _g(f1d, 'rsi14')
+    macd_prev = _g(prev1d, 'macd_hist') if prev1d else np.nan
+    macd_delta= (macd_now - macd_prev) if (not np.isnan(macd_now) and not np.isnan(macd_prev)) else np.nan
+
+    idx = -2 if len(df1d) > 1 else -1
+    try:
+        row = df1d.iloc[idx]
+        rng   = float(row.get('range', np.nan))
+        atr14 = float(row.get('atr14', np.nan))
+        body  = float(row.get('body_pct', np.nan))
+    except Exception:
+        rng=atr14=body=np.nan
+        rep["data_ok"] = False
+        rep["data_issues"].append("iloc_fail")
+
+    # --- passes ---
+    vr_ok = (not np.isnan(vol_ratio)) and (vol_ratio >= vol_ratio_ok)
+    vz_ok = (not np.isnan(vol_z)) and (vol_z >= vol_z_ok)
+    vol_pass = bool(vr_ok or vz_ok)
+
+    md_ok = (not np.isnan(macd_delta)) and (macd_delta > macd_hist_delta_min)
+    rsi_ok= (not np.isnan(rsi_now)) and (rsi_now >= rsi_fast_trigger or rsi_now <= (100.0 - rsi_fast_trigger))
+    mom_pass = bool(md_ok or rsi_ok)
+
+    push_ok = (not np.isnan(rng) and not np.isnan(atr14) and atr14>0 and (rng >= atr_push_min * atr14))
+    body_ok = (not np.isnan(body) and (body >= body_pct_ok))
+    candle_pass = bool(push_ok or body_ok)
+
+    rep.update({
+        "volume": {
+            "passed": vol_pass,
+            "actuals": {"vol_ratio": vol_ratio, "vol_z": vol_z},
+            "thresholds": {"vol_ratio_ok": vol_ratio_ok, "vol_z_ok": vol_z_ok},
+            "sub_criteria": {"vol_ratio_ok": vr_ok, "vol_z_ok": vz_ok}
+        },
+        "momentum": {
+            "passed": mom_pass,
+            "actuals": {"macd_now": macd_now, "macd_prev": macd_prev, "macd_delta": macd_delta, "rsi": rsi_now},
+            "thresholds": {"macd_hist_delta_min": macd_hist_delta_min, "rsi_fast_trigger": rsi_fast_trigger},
+            "sub_criteria": {"macd_delta_ok": md_ok, "rsi_bias_ok": rsi_ok}
+        },
+        "candles": {
+            "passed": candle_pass,
+            "actuals": {"range": rng, "atr14": atr14, "body_pct": body},
+            "thresholds": {"atr_push_min": atr_push_min, "body_pct_ok": body_pct_ok},
+            "sub_criteria": {"push_ok": push_ok, "body_ok": body_ok}
+        }
+    })
+    if not rep["data_ok"]:
+        rep["warning"] = "DATA_GAP"
+    return rep
