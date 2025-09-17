@@ -229,114 +229,6 @@ def _build_checklist(rep: dict) -> str:
     return f"met={met} | missing={miss}"
 
 
-
-
-def _fill_actuals_from_features(rep: dict, f1d: dict, d1_df=None):
-    """Backfill missing 'actuals' in validator_report using 1D features/df (fallback)."""
-    try:
-        if not isinstance(rep, dict):
-            return rep or {}
-        rep = rep or {}
-        # Ensure nested dicts
-        rep.setdefault("volume", {}); rep.setdefault("momentum", {}); rep.setdefault("candles", {})
-        rep["volume"].setdefault("actuals", {}); rep["momentum"].setdefault("actuals", {}); rep["candles"].setdefault("actuals", {})
-        v_a = rep["volume"]["actuals"]; m_a = rep["momentum"]["actuals"]; c_a = rep["candles"]["actuals"]
-
-        # Safe helpers from df
-        def _df_has(col):
-            return (d1_df is not None) and hasattr(d1_df, "columns") and (col in d1_df.columns) and (len(d1_df) > 0)
-        def _df_last(col, default=np.nan):
-            try:
-                return float(d1_df[col].iloc[-1]) if _df_has(col) else default
-            except Exception:
-                return default
-        def _df_prev(col, k=1, default=np.nan):
-            try:
-                return float(d1_df[col].iloc[-1-k]) if (_df_has(col) and len(d1_df) > k) else default
-            except Exception:
-                return default
-
-        # -------- Volume actuals --------
-        if v_a.get("vol_ratio") is None or (isinstance(v_a.get("vol_ratio"), float) and (np.isnan(v_a.get("vol_ratio")))):
-            vr = f1d.get("vol_ratio")
-            if (vr is None) or (isinstance(vr, float) and (np.isnan(vr) or np.isinf(vr))):
-                # compute from df: vol / vol_ma20_prev (exclude current)
-                vol = _df_last("volume", np.nan)
-                vol_ma20 = np.nan
-                try:
-                    if _df_has("volume") and len(d1_df) >= 21:
-                        vol_ma20 = float(d1_df["volume"].iloc[:-1].rolling(20).mean().iloc[-1])
-                except Exception:
-                    pass
-                vr = float(vol / vol_ma20) if (isinstance(vol, (int,float,np.floating)) and isinstance(vol_ma20, (int,float,np.floating)) and vol_ma20 and vol_ma20>0) else np.nan
-            v_a["vol_ratio"] = vr
-
-        if v_a.get("vol_z") is None or (isinstance(v_a.get("vol_z"), float) and (np.isnan(v_a.get("vol_z")))):
-            vz = f1d.get("vol_z")
-            if (vz is None) or (isinstance(vz, float) and (np.isnan(vz) or np.isinf(vz))):
-                # zscore on previous 20 volumes (exclude current)
-                try:
-                    if _df_has("volume") and len(d1_df) >= 21:
-                        prev = d1_df["volume"].iloc[-21:-1].astype(float)
-                        mu = float(prev.mean())
-                        sigma = float(prev.std(ddof=0))
-                        vz = float((float(_df_last("volume")) - mu) / sigma) if sigma and sigma>0 else np.nan
-                    else:
-                        vz = np.nan
-                except Exception:
-                    vz = np.nan
-            v_a["vol_z"] = vz
-
-        # -------- Momentum actuals --------
-        md = m_a.get("macd_delta")
-        if (md is None) or (isinstance(md, float) and (np.isnan(md) or np.isinf(md))):
-            # prefer df difference
-            if _df_has("macd_hist") and len(d1_df) >= 2:
-                try:
-                    md = float(d1_df["macd_hist"].iloc[-1]) - float(d1_df["macd_hist"].iloc[-2])
-                except Exception:
-                    md = None
-            if md is None or (isinstance(md, float) and (np.isnan(md) or np.isinf(md))):
-                md = f1d.get("macd_hist")
-                # fallback delta ~ current - 0
-                md = float(md) if isinstance(md, (int,float,np.floating)) else 0.0
-            m_a["macd_delta"] = md
-
-        if m_a.get("rsi14") is None or (isinstance(m_a.get("rsi14"), float) and (np.isnan(m_a.get("rsi14")))):
-            rsi = f1d.get("rsi14")
-            if (rsi is None) or (isinstance(rsi, float) and (np.isnan(rsi) or np.isinf(rsi))):
-                rsi = _df_last("rsi14", np.nan)
-            m_a["rsi14"] = rsi
-
-        # -------- Candle actuals --------
-        if c_a.get("range") is None or (isinstance(c_a.get("range"), float) and (np.isnan(c_a.get("range")))):
-            rng = f1d.get("range")
-            if (rng is None) or (isinstance(rng, float) and (np.isnan(rng) or np.isinf(rng))):
-                hi = _df_last("high", np.nan); lo = _df_last("low", np.nan)
-                rng = float(hi - lo) if (isinstance(hi,(int,float,np.floating)) and isinstance(lo,(int,float,np.floating))) else np.nan
-            c_a["range"] = rng
-
-        if c_a.get("atr14") is None or (isinstance(c_a.get("atr14"), float) and (np.isnan(c_a.get("atr14")))):
-            atr = f1d.get("atr14")
-            if (atr is None) or (isinstance(atr, float) and (np.isnan(atr) or np.isinf(atr))):
-                atr = _df_last("atr14", np.nan)
-            c_a["atr14"] = atr
-
-        if c_a.get("body_pct") is None or (isinstance(c_a.get("body_pct"), float) and (np.isnan(c_a.get("body_pct")))):
-            bp = f1d.get("body_pct")
-            if (bp is None) or (isinstance(bp, float) and (np.isnan(bp) or np.isinf(bp))):
-                op = _df_last("open", np.nan); cl = _df_last("close", np.nan)
-                hi = _df_last("high", np.nan); lo = _df_last("low", np.nan)
-                denom = float(hi - lo) if (isinstance(hi,(int,float,np.floating)) and isinstance(lo,(int,float,np.floating))) else np.nan
-                if denom and denom>0 and isinstance(op,(int,float,np.floating)) and isinstance(cl,(int,float,np.floating)):
-                    bp = float(abs(cl - op) / denom)
-                else:
-                    bp = np.nan
-            c_a["body_pct"] = bp
-
-    except Exception:
-        pass
-    return rep
 # =========================
 # Small helpers
 # =========================
@@ -589,17 +481,10 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
     # build validator benchmark strings up front so all return paths can include them
     try:
         rep = (ev.get("validator_report") if isinstance(ev, dict) else {}) or {}
-        # Defaults to avoid 'nan>=nan' when validator_report is missing
-        rep = rep or {}
-        rep.setdefault('volume', {}).setdefault('thresholds', {'vol_ratio_ok': 1.2, 'vol_z_ok': 0.5})
-        rep.setdefault('momentum', {}).setdefault('thresholds', {'macd_hist_delta_min': 0.0, 'rsi_fast_trigger': 55.0})
-        rep.setdefault('candles', {}).setdefault('thresholds', {'atr_push_min': 0.6, 'body_pct_ok': 0.35})
-        rep = _fill_actuals_from_features(rep, f1d, df1d)
         _validator_line = _build_validator_line(rep)
         _validator_checklist = _build_checklist(rep)
-    except Exception:
-        _validator_line = ""
-        _validator_checklist = ""
+    except Exception: _validator_line = ""; _validator_checklist = ""
+      
     out: Dict[str, Any] = {
         "symbol": sym,
         "timeframe_primary": cfg["primary_tf"],
@@ -647,16 +532,20 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
         notes = "; ".join(out.get("notes", [])) if out.get("notes") else ""
         # still log internally; plus we've exported strings above for main.py
         rep = ev.get("validator_report", {})
-        # Defaults to avoid 'nan>=nan' when validator_report is missing
-        rep = (rep or {})
-        rep.setdefault('volume', {}).setdefault('thresholds', {'vol_ratio_ok': 1.2, 'vol_z_ok': 0.5})
-        rep.setdefault('momentum', {}).setdefault('thresholds', {'macd_hist_delta_min': 0.0, 'rsi_fast_trigger': 55.0})
-        rep.setdefault('candles', {}).setdefault('thresholds', {'atr_push_min': 0.6, 'body_pct_ok': 0.35})
-        rep = _fill_actuals_from_features(rep, f1d, d1.get('df') if isinstance(d1, dict) else None)
-        out['validator_report'] = rep
+        # Ensure momentum.actuals.rsi from features/df
+        rep = rep or {}
+        rep.setdefault('momentum', {}).setdefault('actuals', {})
+        try:
+            _rsi_val = f1d.get('rsi14')
+            if (_rsi_val is None) or (isinstance(_rsi_val, float) and (np.isnan(_rsi_val) or np.isinf(_rsi_val))):
+                if df1d is not None and hasattr(df1d, 'columns') and ('rsi14' in df1d.columns) and len(df1d)>0:
+                    _rsi_val = float(df1d['rsi14'].iloc[-1])
+        except Exception:
+            _rsi_val = np.nan
+        rep['momentum']['actuals']['rsi14'] = _rsi_val
+        rep['momentum']['actuals']['rsi'] = _rsi_val
         bench_line = _build_validator_line(rep)
         checklist  = _build_checklist(rep)
-        out["validator_line"] = bench_line; out["validator_checklist"] = checklist
         log_info(
             f"[{out['symbol']}] DECISION=WAIT | STATE={out.get('STATE')} | DIR={out.get('DIRECTION')} | "
             f"reason={reason} | confirm:V={V_ok} M={M_ok} C={C_ok} | {bench_line} | {checklist} | "
@@ -697,37 +586,34 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
                 # bật cờ relaxed, cho phép vào lệnh tiếp tục theo flow chuẩn bên dưới
                 out["notes"].append("validators_relaxed: weekly_ok & near_ema20 & not_overext & rr_ok")
                 # đánh dấu để hạ size sau khi build plan
+                # Ensure momentum.actuals.rsi from features/df
+                rep = rep or {}
+                rep.setdefault('momentum', {}).setdefault('actuals', {})
+                try:
+                    _rsi_val = f1d.get('rsi14')
+                    if (_rsi_val is None) or (isinstance(_rsi_val, float) and (np.isnan(_rsi_val) or np.isinf(_rsi_val))):
+                        if df1d is not None and hasattr(df1d, 'columns') and ('rsi14' in df1d.columns) and len(df1d)>0:
+                            _rsi_val = float(df1d['rsi14'].iloc[-1])
+                except Exception:
+                    _rsi_val = np.nan
+                rep['momentum']['actuals']['rsi14'] = _rsi_val
+                rep['momentum']['actuals']['rsi'] = _rsi_val
                 out["__relaxed_pass__"] = True
                 can_enter = True
 
     if not can_enter:
         _conf = out["confirmations"]
         V_ok = bool(_conf.get("volume", False))
-        # Defaults to avoid 'nan>=nan' when validator_report is missing
-        rep = (rep or {})
-        rep.setdefault('volume', {}).setdefault('thresholds', {'vol_ratio_ok': 1.2, 'vol_z_ok': 0.5})
-        rep.setdefault('momentum', {}).setdefault('thresholds', {'macd_hist_delta_min': 0.0, 'rsi_fast_trigger': 55.0})
-        rep.setdefault('candles', {}).setdefault('thresholds', {'atr_push_min': 0.6, 'body_pct_ok': 0.35})
-        rep = _fill_actuals_from_features(rep, f1d, d1.get('df') if isinstance(d1, dict) else None)
-        out['validator_report'] = rep
         M_ok = bool(_conf.get("momentum", False))
         C_ok = bool(_conf.get("candles", False))
         out["confirm"] = {"V": V_ok, "M": M_ok, "C": C_ok}
         # Khi có setup (WAIT/SETUP), vẫn in benchmark để bạn theo dõi
         if DEBUG_VALIDATORS:
-            rep = ev.get('validator_report', {})
-            # Defaults to avoid 'nan>=nan' when validator_report is missing
-            rep = (rep or {})
-            rep.setdefault('volume', {}).setdefault('thresholds', {'vol_ratio_ok': 1.2, 'vol_z_ok': 0.5})
-            rep.setdefault('momentum', {}).setdefault('thresholds', {'macd_hist_delta_min': 0.0, 'rsi_fast_trigger': 55.0})
-            rep.setdefault('candles', {}).setdefault('thresholds', {'atr_push_min': 0.6, 'body_pct_ok': 0.35})
-            rep = _fill_actuals_from_features(rep, f1d, d1.get('df') if isinstance(d1, dict) else None)
-            out['validator_report'] = rep
+            rep = ev.get("validator_report", {})
             bench_line = _build_validator_line(rep)
             checklist  = _build_checklist(rep)
-            out["validator_line"] = bench_line
-            out["validator_checklist"] = checklist
             log_info(f"[{out['symbol']}] VALIDATORS | {bench_line} | {checklist}")
+        _debug_dump_validators(out["symbol"], f1d, out.get("confirmations", {}))
 
         # NEW: vẫn phát hành setup khi WAIT nếu state được cho phép
         st_lower = (out.get("STATE") or "").lower()
@@ -758,8 +644,8 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
                     pass
                 out["notes"].append("setup_on_WAIT: emitted plan for bullish_potential (idea only)")
             # ensure validator strings present even if no setup emitted
-            out["validator_line"] = _validator_line
-            out["validator_checklist"] = _validator_checklist  
+            out.setdefault("validator_line", _validator_line)
+            out.setdefault("validator_checklist", _validator_checklist)  
 
         reason = ",".join(out["missing"]) if out.get("missing") else "missing_features"
         notes = "; ".join(out.get("notes", [])) if out.get("notes") else ""
