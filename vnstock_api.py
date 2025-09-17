@@ -288,7 +288,6 @@ __all__ = [
     "fetch_ohlcv_batch",
 ]
 
-
 def fetch_ohlcv(symbol: str, timeframe: str = "1D", limit: int = 600, include_partial: bool = False) -> pd.DataFrame:
     """Fetch a single timeframe → DataFrame indexed by UTC with columns [open,high,low,close,volume]."""
     vnstock_mod = _load_vnstock()
@@ -409,8 +408,7 @@ def fetch_ohlcv_batch(
 ) -> Dict[str, pd.DataFrame]:
     """Batch-fetch *one timeframe* for *many symbols*.
 
-    This matches the expectation in main.py where `fetch_ohlcv_batch(symbols, timeframe=..., ...)`
-    returns a mapping {symbol: DataFrame} and paces requests to avoid 429.
+    Returns a mapping {symbol: DataFrame} and paces requests to avoid 429.
     """
     out: Dict[str, pd.DataFrame] = {}
     symbols = symbols or []
@@ -427,30 +425,6 @@ def fetch_ohlcv_batch(
             empty.attrs["error"] = str(e)
             empty.attrs["debug"] = f"fetch_ohlcv_failed({sym},{timeframe})"
             out[sym] = empty
-    return out
-
-    symbol: str,
-    timeframes: Tuple[str, ...] = ("1D", "1W"),
-    limit: int = 600,
-    include_partial: bool = False,
-    step_sleep_sec: float = 0.6,
-) -> Dict[str, pd.DataFrame]:
-    """Fetch multiple timeframes for one symbol in a rate-limit-friendly way.
-
-    Returns a dict {tf_input: DataFrame}
-    """
-    out: Dict[str, pd.DataFrame] = {}
-    for i, tf in enumerate(timeframes):
-        if i > 0:
-            _sleep_base(step_sleep_sec)
-        try:
-            out[tf] = fetch_ohlcv(symbol, timeframe=tf, limit=limit, include_partial=include_partial)
-        except NotImplementedError as e:
-            # provide empty frame for unsupported tf
-            empty = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])  # UTC index
-            empty.index = pd.DatetimeIndex([], tz=timezone.utc)
-            empty.attrs["error"] = str(e)
-            out[tf] = empty
     return out
 
 
@@ -482,3 +456,11 @@ if __name__ == "__main__":
             print(k, "→", len(v))
     except Exception as e:
         print("fetch_batch error:", e)
+
+    print("Testing fetch_ohlcv_batch ...")
+    try:
+        b = fetch_ohlcv_batch(["VCB", "CTG"], timeframe="1D", limit=120)
+        for k, v in b.items():
+            print(k, "rows:", len(v))
+    except Exception as e:
+        print("fetch_ohlcv_batch error:", e)
