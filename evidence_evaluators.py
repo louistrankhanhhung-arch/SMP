@@ -301,13 +301,31 @@ def _mean_revert(df1d: pd.DataFrame, f1d: dict, cfg: dict) -> Tuple[float, str]:
     return score, note
 
 def _squeeze_expansion(df1d: pd.DataFrame, f1d: dict, prev1d: dict | None, cfg: dict) -> Tuple[float, str]:
-    bw = _get(f1d, 'bb_width', np.nan); bw_prev = _get(prev1d, 'bb_width', np.nan) if prev1d else np.nan
+    # Bollinger width
+    bw = _get(f1d, 'bb_width', np.nan)
+    bw_prev = _get(prev1d, 'bb_width', np.nan) if prev1d else np.nan
     low = (not np.isnan(bw)) and (bw <= cfg['bb_width_low'])
-    expanding = (not np.isnan(bw) and not np.isnan(bw_prev)) and ((bw - bw_prev) >= cfg['bb_width_expand'])
-    # Chuẩn hóa: chỉ nhận khi có bùng nén thật sự
-    expanding = (not np.isnan(bw) and not np.isnan(bw_prev) and (bw - bw_prev) >= cfg['bb_width_expand'])
+    expanding = (not np.isnan(bw) and not np.isnan(bw_prev) and ((bw - bw_prev) >= cfg['bb_width_expand']))
+
+    # Closed-bar anatomy values
+    rng = _get(f1d, 'range', np.nan)
+    atr14 = _get(f1d, 'atr14', np.nan)
+    if (np.isnan(rng) or np.isnan(atr14)) and df1d is not None and len(df1d) >= 1:
+        idx = _last_closed_idx_df(df1d)
+        row = df1d.iloc[idx]
+        if np.isnan(rng):   rng   = float(row.get('range', float(row.get('high', np.nan) - row.get('low', np.nan))))
+        if np.isnan(atr14): atr14 = float(row.get('atr14', np.nan))
+
+    # Break of previous high
+    prev_high = np.nan
+    close = _get(f1d, 'close', np.nan)
+    if df1d is not None and len(df1d) >= 2:
+        idx = _last_closed_idx_df(df1d)
+        if idx - 1 >= 0:
+            prev_high = float(df1d.iloc[idx-1].get('high', np.nan))
+
     push = (not np.isnan(atr14) and not np.isnan(rng) and rng >= 0.8 * atr14)
-    break_high = (not np.isnan(close) and not np.isnan(prev_high) and close > prev_high)
+    break_high = (not np.isnan(close) and not np.isnan(prev_high) and (close > prev_high))
     ok = bool((low or expanding) and push and break_high)
     score = 0.60 if ok else 0.0
     note = "squeeze_expansion: low/expanding + ATR push + close>high[-1]" if ok else "n/a"
