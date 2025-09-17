@@ -337,40 +337,6 @@ def _fill_actuals_from_features(rep: dict, f1d: dict, d1_df=None):
     except Exception:
         pass
     return rep
-        # Ensure nested dicts
-        rep.setdefault("volume", {}); rep.setdefault("momentum", {}); rep.setdefault("candles", {})
-        rep["volume"].setdefault("actuals", {}); rep["momentum"].setdefault("actuals", {}); rep["candles"].setdefault("actuals", {})
-        v_a = rep["volume"]["actuals"]; m_a = rep["momentum"]["actuals"]; c_a = rep["candles"]["actuals"]
-        # Volume actuals
-        if v_a.get("vol_ratio") is None or (isinstance(v_a.get("vol_ratio"), float) and (np.isnan(v_a.get("vol_ratio")))):
-            v_a["vol_ratio"] = f1d.get("vol_ratio")
-        if v_a.get("vol_z") is None or (isinstance(v_a.get("vol_z"), float) and (np.isnan(v_a.get("vol_z")))):
-            v_a["vol_z"] = f1d.get("vol_z")
-        # Momentum actuals
-        # macd_delta: try from df (last - prev). Fall back to 0.0 if not computable (keeps FAIL conservatively)
-        md = None
-        try:
-            if d1_df is not None and hasattr(d1_df, "shape") and d1_df.shape[0] >= 2 and "macd_hist" in d1_df.columns:
-                md = float(d1_df["macd_hist"].iloc[-1] - d1_df["macd_hist"].iloc[-2])
-        except Exception:
-            md = None
-        if md is None or (isinstance(md, float) and (np.isnan(md) or np.isinf(md))):
-            # as a conservative fallback, do not inflate; set to 0.0 so it won't PASS spuriously
-            md = 0.0 if isinstance(f1d.get("macd_hist"), (int, float, np.floating)) else np.nan
-        if m_a.get("macd_delta") is None or (isinstance(m_a.get("macd_delta"), float) and (np.isnan(m_a.get("macd_delta")))):
-            m_a["macd_delta"] = md
-        if m_a.get("rsi14") is None or (isinstance(m_a.get("rsi14"), float) and (np.isnan(m_a.get("rsi14")))):
-            m_a["rsi14"] = f1d.get("rsi14")
-        # Candle actuals
-        if c_a.get("range") is None or (isinstance(c_a.get("range"), float) and (np.isnan(c_a.get("range")))):
-            c_a["range"] = f1d.get("range")
-        if c_a.get("atr14") is None or (isinstance(c_a.get("atr14"), float) and (np.isnan(c_a.get("atr14")))):
-            c_a["atr14"] = f1d.get("atr14")
-        if c_a.get("body_pct") is None or (isinstance(c_a.get("body_pct"), float) and (np.isnan(c_a.get("body_pct")))):
-            c_a["body_pct"] = f1d.get("body_pct")
-    except Exception:
-        pass
-    return rep
 # =========================
 # Small helpers
 # =========================
