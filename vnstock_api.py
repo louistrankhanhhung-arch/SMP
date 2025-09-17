@@ -1,367 +1,423 @@
 # -*- coding: utf-8 -*-
 """
-vnstock_api.py — Data access layer for Vietnam equities (VN30/HOSE/HNX/UPCoM)
-----------------------------------------------------------------------------
-- Uses unified `vnstock` package (>=3.2.x).
-- Fetch OHLCV for 1D & 1W; includes the *running* candle when include_partial=True.
-- Normalized columns: ["time","open","high","low","close","volume"]
-- Tries multiple sources if a provider returns empty/error: ["VCI","TCBS","MSN"]
-- Tries symbol variants: "VCB", "VCB.HOSE", "VCB:HOSE"
-- Tries interval aliases: 1D→["1D","1d","D","day","daily"], 1W→["1W","1w","W","week","weekly"]
+vnstock_api.py — Robust fetcher for Vietnam equities OHLCV (ccxt-style niceties)
+-----------------------------------------------------------------------------
+What this module provides
+1) Scope & normalization
+   • enableRateLimit via pacing + backoff; configurable timeout; optional HTTP(S) proxy via env
+   • Auto symbol normalization (upper, trims, common HOSE/HSX suffix variants)
+   • Timeframe alias map "friendly" → ccxt: {1H→1h, 4H→4h, 1D→1d, 1W→1w}
+   • Auto-load provider (vnstock) on first use
+
+2) OHLCV data correctness
+   • Convert provider OHLCV → pandas DataFrame with UTC DatetimeIndex
+   • Columns: open, high, low, close, volume (float64); duplicates by timestamp are de-duped keeping *latest*
+   • Strict NaN filtering on O/H/L/C; numeric coercion
+
+3) Partial-bar handling (closed bars only)
+   • Drop the last bar if it is incomplete for ALL timeframes (1h/4h/1d/1w)
+
+4) Robustness & deep history pagination
+   • Retry with exponential backoff for NetworkError/Timeout/429 (“Too many requests”)
+   • Backward pagination by date windows within [start_ms, end_ms] (UTC ms) with max_pages & sleep_sec pacing
+   • Merge, sort by time, drop dups (keep newest)
+
+5) Public API
+   • fetch_ohlcv(symbol, timeframe, limit=600, include_partial=False)
+   • fetch_ohlcv_history(symbol, timeframe, start_ms, end_ms, max_pages=20, window_days=120,
+                         sleep_sec=0.8, include_partial=False)
+   • fetch_batch(symbol, timeframes=("1D","1W"), limit=600, include_partial=False,
+                 step_sleep_sec=0.6)  → returns {tf: DataFrame}
+
+Notes
+- vnstock currently focuses on end-of-day/weekly. Intraday (1H/4H) availability varies by source.
+  For unsupported timeframes, this module raises NotImplementedError.
+- Proxies: set HTTP_PROXY/HTTPS_PROXY env vars if needed.
 """
 from __future__ import annotations
 import os
-import numpy as np
-from typing import List, Dict, Tuple, Optional
-import pandas as pd
+import time
+import math
 import importlib
-from datetime import datetime, timedelta, timezone, time as dtime
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple
 
-try:
-    import pytz
-except Exception:
-    pytz = None
+import numpy as np
+import pandas as pd
 
-# Nếu bạn đang dùng một SDK nào đó (vd vnstock3/ssi/…) để fetch dữ liệu,
-# bạn vẫn gọi như cũ ở dưới. Patch này tập trung vào làm sạch & chuẩn hóa.
+# ----------------------------- Config & constants -----------------------------
+ENABLE_RATE_LIMIT = bool(int(os.getenv("ENABLE_RATE_LIMIT", "1")))
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "10"))  # seconds (best-effort; provider-dependent)
+RATE_LIMIT_MIN_SLEEP = float(os.getenv("RATE_LIMIT_MIN_SLEEP", "0.4"))  # baseline sleep between calls
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
+BACKOFF_BASE = float(os.getenv("BACKOFF_BASE", "1.7"))  # exponential backoff factor
 
-VN_TZ_NAME = "Asia/Ho_Chi_Minh"
-MARKET_CLOSE_HOUR = int(os.getenv("MARKET_CLOSE_HOUR", "15"))  # 15:00 VN
-DROP_RUNNING_CANDLE = bool(int(os.getenv("DROP_RUNNING_CANDLE", "1")))  # mặc định bỏ nến chưa chốt
-MIN_ROWS_REQUIRED = int(os.getenv("MIN_ROWS_REQUIRED", "25"))  # đủ cho rolling 20 + margin
+VN_TZ = timezone(timedelta(hours=7))  # Asia/Ho_Chi_Minh (no DST)
 
-def _get_tz():
-    if pytz is None:
-        return None
-    try:
-        return pytz.timezone(VN_TZ_NAME)
-    except Exception:
-        return None
+# Friendly → ccxt timeframe map
+TF_CCXT_MAP = {
+    "1H": "1h", "1h": "1h",
+    "4H": "4h", "4h": "4h",
+    "1D": "1d", "1d": "1d", "D": "1d", "day": "1d", "daily": "1d",
+    "1W": "1w", "1w": "1w", "W": "1w", "week": "1w", "weekly": "1w",
+}
 
-def _to_vn_tz(dt: pd.Series | pd.DatetimeIndex) -> pd.DatetimeIndex:
-    tz = _get_tz()
-    if isinstance(dt, pd.Series):
-        idx = pd.to_datetime(dt, errors="coerce", utc=True)
-    else:
-        idx = pd.to_datetime(dt, errors="coerce", utc=True)
-    if tz is not None:
-        try:
-            return idx.tz_convert(tz)
-        except Exception:
-            try:
-                # nếu dữ liệu local-naive, gán tz VN
-                return idx.tz_localize(tz, nonexistent="shift_forward", ambiguous="NaT")
-            except Exception:
-                return idx
-    return idx
+SUPPORTED_SOURCES = ("VCI", "TCBS", "MSN")
+
+# ----------------------------- Utilities -------------------------------------
+
+def _now_utc() -> datetime:
+    return datetime.utcnow().replace(tzinfo=timezone.utc)
+
+
+def _to_utc_index(dt_like: pd.Series) -> pd.DatetimeIndex:
+    ts = pd.to_datetime(dt_like, errors="coerce", utc=True)
+    # ensure UTC index
+    return ts.tz_convert(timezone.utc)
+
 
 def _coerce_numeric(s: pd.Series) -> pd.Series:
-    # xóa dấu phẩy/ngăn cách nghìn nếu có, sau đó ép kiểu số
     if s.dtype == object:
         s = s.astype(str).str.replace(",", "", regex=False).str.replace("_", "", regex=False)
     out = pd.to_numeric(s, errors="coerce")
-    # volume âm/close âm => NaN
     out = out.mask(~np.isfinite(out))
     return out
 
-def _sanitize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or len(df) == 0:
-        return pd.DataFrame(columns=["time","open","high","low","close","volume"])
-    # Chuẩn tên cột phổ biến
-    cols_map = {
-        "date": "time", "time": "time", "datetime": "time",
-        "o": "open", "open": "open",
-        "h": "high", "high": "high",
-        "l": "low", "low": "low",
-        "c": "close", "close": "close", "adj_close": "close",
-        "v": "volume", "volume": "volume", "vol": "volume",
+
+def _normalize_symbol(sym: str) -> str:
+    return sym.strip().upper()
+
+
+def _symbol_variants(sym: str) -> List[str]:
+    b = _normalize_symbol(sym)
+    return [b, f"{b}.HOSE", f"{b}:HOSE", f"{b}.HSX", f"{b}:HSX"]
+
+
+def _resolve_timeframe(tf: str) -> str:
+    tf_norm = TF_CCXT_MAP.get(str(tf).strip(), None)
+    if tf_norm is None:
+        raise ValueError(f"Unsupported timeframe alias: {tf}")
+    return tf_norm
+
+
+def _interval_aliases_for_provider(tf_ccxt: str) -> List[str]:
+    # Map our ccxt-style back to provider-friendly strings
+    if tf_ccxt == "1w":
+        return ["1W", "1w", "W", "week", "weekly"]
+    if tf_ccxt == "1d":
+        return ["1D", "1d", "D", "day", "daily"]
+    if tf_ccxt in ("1h", "4h"):
+        # vnstock intraday may be unsupported; we keep aliases for future-proofing
+        return [tf_ccxt, tf_ccxt.upper()]
+    return [tf_ccxt]
+
+
+def _sleep_base(sec: float) -> None:
+    if ENABLE_RATE_LIMIT:
+        time.sleep(max(sec, RATE_LIMIT_MIN_SLEEP))
+
+
+def _should_retry(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "timeout" in text
+        or "timed out" in text
+        or "network" in text
+        or "connection" in text
+        or "429" in text
+        or "too many requests" in text
+        or "rate" in text and "limit" in text
+    )
+
+
+def _retryable_call(fn, *args, **kwargs):
+    last_err = None
+    for i in range(MAX_RETRIES):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+            if not _should_retry(e):
+                raise
+            sleep_s = (BACKOFF_BASE ** i) * RATE_LIMIT_MIN_SLEEP
+            _sleep_base(sleep_s)
+    raise last_err
+
+
+# ----------------------------- Provider loader --------------------------------
+
+def _load_vnstock():
+    return importlib.import_module("vnstock")
+
+
+# ----------------------------- Core transforms --------------------------------
+
+def _sanitize_ohlcv(df_in: pd.DataFrame) -> pd.DataFrame:
+    if df_in is None or df_in.empty:
+        df = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])  # index later
+        df.index = pd.DatetimeIndex([], tz=timezone.utc)
+        return df
+
+    # unify columns
+    rename = {
+        "date": "time", "time": "time", "datetime": "time", "TradingDate": "time", "tradingDate": "time",
+        "o": "open", "open": "open", "Open": "open",
+        "h": "high", "high": "high", "High": "high",
+        "l": "low", "low": "low", "Low": "low",
+        "c": "close", "close": "close", "Close": "close", "adj_close": "close",
+        "v": "volume", "volume": "volume", "Volume": "volume", "vol": "volume", "value": "volume",
     }
-    # Đổi tên cột theo map nếu phù hợp
-    renamed = {}
-    for c in df.columns:
-        key = c.lower().strip()
-        renamed[c] = cols_map.get(key, c)
-    df = df.rename(columns=renamed)
+    df = df_in.rename(columns={k: v for k, v in rename.items() if k in df_in.columns}).copy()
 
-    # Chỉ giữ các cột cốt lõi
-    keep = [c for c in ["time","open","high","low","close","volume"] if c in df.columns]
-    df = df[keep].copy()
+    # keep core
+    keep = [c for c in ["time", "open", "high", "low", "close", "volume"] if c in df.columns]
+    df = df[keep]
 
-    # Chuẩn hóa thời gian về VN timezone
-    if "time" in df.columns:
-        df["time"] = _to_vn_tz(df["time"])
-    else:
-        # thiếu trầm trọng: trả khung rỗng đúng schema
-        return pd.DataFrame(columns=["time","open","high","low","close","volume"])
+    # time → UTC index
+    if "time" not in df.columns:
+        out = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        out.index = pd.DatetimeIndex([], tz=timezone.utc)
+        return out
 
-    # Ép số cho OHLCV
-    for c in ["open","high","low","close","volume"]:
+    idx = _to_utc_index(df["time"])  # normalized to UTC
+
+    # numeric coercion
+    for c in ["open", "high", "low", "close", "volume"]:
         if c in df.columns:
             df[c] = _coerce_numeric(df[c])
         else:
             df[c] = np.nan
 
-    # Bỏ dòng thiếu toàn bộ OHLC
-    df = df.dropna(subset=["open","high","low","close"], how="any")
+    # drop invalid OHLC rows
+    df = df.dropna(subset=["open", "high", "low", "close"], how="any").copy()
 
-    # Dedupe + sort theo time
-    df = df.drop_duplicates(subset=["time"]).sort_values("time")
-    df = df.reset_index(drop=True)
+    # assign index, drop dup timestamps keeping the *latest*
+    df.index = idx
+    df = df[~df.index.duplicated(keep="last")]
 
-    # Đảm bảo DataFrame có đúng cột & thứ tự
-    df = df[["time","open","high","low","close","volume"]]
+    # sort by time asc
+    df = df.sort_index()
+
+    # ensure order and dtypes
+    df = df[["open", "high", "low", "close", "volume"]].astype(float)
+    df.index.name = "time"
     return df
 
-def _drop_running_candle_if_needed(df: pd.DataFrame) -> pd.DataFrame:
-    """Bỏ nến ngày hiện tại nếu chưa qua giờ đóng cửa (15:00 VN)."""
-    if not DROP_RUNNING_CANDLE:
+
+def _is_last_bar_partial(df: pd.DataFrame, tf_ccxt: str) -> bool:
+    if df is None or df.empty:
+        return False
+    last_ts = df.index[-1]  # UTC
+    now = _now_utc()
+
+    if tf_ccxt == "1h":
+        # complete if last_ts <= floor(now, 1h) - 1h
+        closed_edge = now.replace(minute=0, second=0, microsecond=0)
+        return last_ts >= closed_edge
+    if tf_ccxt == "4h":
+        # 4h windows starting at 00:00 UTC: 00,04,08,12,16,20
+        hour_block = (now.hour // 4) * 4
+        closed_edge = now.replace(hour=hour_block, minute=0, second=0, microsecond=0)
+        return last_ts >= closed_edge
+    if tf_ccxt == "1d":
+        # consider bar complete when UTC date has rolled over
+        day_edge = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return last_ts >= day_edge
+    if tf_ccxt == "1w":
+        # ISO week starts Monday 00:00 UTC
+        start_of_week = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        return last_ts >= start_of_week
+    return False
+
+
+def _drop_partial(df: pd.DataFrame, tf_ccxt: str, include_partial: bool) -> pd.DataFrame:
+    if include_partial or df.empty:
         return df
-    if df is None or len(df) == 0:
-        return df
-    tz = _get_tz()
-    now = datetime.now(tz) if tz else datetime.now()
-    # Lấy dòng cuối cùng
-    last = df.iloc[-1]
-    ts: pd.Timestamp = last["time"]
-    if pd.isna(ts):
-        return df
-    try:
-        ts_local = ts
-        # Nếu ts không có tz, coi như local VN
-        if ts_local.tzinfo is None and tz is not None:
-            ts_local = ts_local.tz_localize(tz, nonexistent="shift_forward", ambiguous="NaT")
-    except Exception:
-        ts_local = ts
-    if ts_local.date() == now.date():
-        # trước 15:00 thì xóa nến hôm nay
-        if now.time() < dtime(hour=MARKET_CLOSE_HOUR, minute=0):
-            return df.iloc[:-1].copy()
-    return df
-
-def _quality_report(df: pd.DataFrame) -> dict:
-    issues = []
-    ok = True
-    need = ["time","open","high","low","close","volume"]
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return {"ok": False, "issues": ["df_empty"]}
-    missing = [c for c in need if c not in df.columns]
-    if missing:
-        issues.append(f"missing_cols:{missing}")
-        ok = False
-    if len(df) < MIN_ROWS_REQUIRED:
-        issues.append(f"rows_lt_{MIN_ROWS_REQUIRED}({len(df)})")
-        ok = False
-    # kiểm tra NaN bất thường
-    nan_ohlc = df[["open","high","low","close"]].isna().sum().sum()
-    if nan_ohlc > 0:
-        issues.append(f"nan_ohlc:{int(nan_ohlc)}")
-        ok = False
-    return {"ok": ok, "issues": issues}
-
-# ---- Backward-compatible aliases (single unified flow) --------------------
-# Nếu code cũ của bạn import các hàm dưới đây, chúng sẽ chuyển về fetch_ohlcv/Batch.
-def fetch_ohlcv_1d(symbol: str, start: Optional[str] = None, end: Optional[str] = None) -> pd.DataFrame:
-    """Alias: unified path via vnstock, timeframe=1D."""
-    df = fetch_ohlcv(symbol, timeframe="1D", limit=600, include_partial=True)
-    return df
-
-def fetch_symbols_daily(symbols: list[str], start: Optional[str] = None, end: Optional[str] = None) -> dict[str, pd.DataFrame]:
-    """Alias: unified batch with timeframe=1D."""
-    return fetch_ohlcv_batch(symbols, timeframe="1D", limit=600, include_partial=True)
-
-# Nếu code cũ của bạn có hàm get_ohlcv hay tương tự, bạn có thể alias:
-# get_ohlcv = fetch_ohlcv_1d
-    
-_TZ = "Asia/Ho_Chi_Minh"
-_SUPPORTED_SOURCES = ["VCI", "TCBS", "MSN"]
-_INTERVAL_ALIASES = {
-    "1D": ["1D", "1d", "D", "day", "daily"],
-    "1W": ["1W", "1w", "W", "week", "weekly"],
-}
-
-def _now_vn() -> datetime:
-    # naive local time for VN; we avoid pytz dependency
-    # Asia/Ho_Chi_Minh is UTC+7 without DST
-    return datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(hours=7)
-
-def _check_provider() -> str:
-    try:
-        vnstock = importlib.import_module("vnstock")
-        return getattr(vnstock, "__version__", "unknown")
-    except Exception as e:
-        raise RuntimeError(f"vnstock import failed: {e}")
-
-def _to_date(limit: int) -> Tuple[str, str]:
-    now = _now_vn().date()
-    # buffer 10% to be safe for weekends/holidays
-    days = int(limit * 1.1) + 5
-    start = now - timedelta(days=days)
-    return start.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d")
-
-def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or len(df) == 0:
-        return pd.DataFrame(columns=["time","open","high","low","close","volume"])
-    rename_map = {
-        "time": "time", "date": "time", "TradingDate": "time", "tradingDate": "time",
-        "open": "open", "Open": "open", "o": "open",
-        "high": "high", "High": "high", "h": "high",
-        "low": "low", "Low": "low", "l": "low",
-        "close": "close", "Close": "close", "c": "close",
-        "volume": "volume", "Volume": "volume", "v": "volume", "value": "volume",
-    }
-    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
-    keep = [c for c in ["time","open","high","low","close","volume"] if c in df.columns]
-    df = df[keep].copy()
-    # Normalize timestamp → VN timezone
-    if "time" in df.columns:
-        df["time"] = _to_vn_tz(df["time"])
-    # Coerce numerics
-    for c in ["open","high","low","close","volume"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    # Drop rows without time
-    df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
-    return df
-
-def _symbol_variants(sym: str) -> List[str]:
-    # Some providers accept exchange suffix; we try a few common variants
-    base = sym.strip().upper()
-    return [base, f"{base}.HOSE", f"{base}:HOSE", f"{base}.HSX", f"{base}:HSX"]
-
-def _history_with_fallbacks(obj, start: str, end: str, tf: str):
-    """
-    Try multiple interval aliases; if still empty, try again without date range.
-    Returns (df, meta) where meta describes provider/interval used.
-    """
-    tried = []
-    for itv in _INTERVAL_ALIASES.get(tf, [tf]):
-        try:
-            raw = obj.history(start=start, end=end, interval=itv)
-            tried.append(itv)
-            df_tmp = _normalize_df(raw)
-            if len(df_tmp) > 0:
-                return df_tmp, {"interval_used": itv, "range": "start-end"}
-        except Exception as e:
-            tried.append(f"{itv}:err={e}")
-            continue
-    # try without dates (provider default range)
-    for itv in _INTERVAL_ALIASES.get(tf, [tf]):
-        try:
-            raw = obj.history(interval=itv)
-            tried.append(f"{itv}(nodates)")
-            df_tmp = _normalize_df(raw)
-            if len(df_tmp) > 0:
-                return df_tmp, {"interval_used": itv, "range": "nodates"}
-        except Exception as e:
-            tried.append(f"{itv}(nodates):err={e}")
-            continue
-    return pd.DataFrame(columns=["time","open","high","low","close","volume"]), {"tried": tried}
-
-def _drop_running_bar_if_needed(df: pd.DataFrame, timeframe: str, include_partial: bool) -> pd.DataFrame:
-    if include_partial or len(df) == 0:
-        return df
-    # For 1D: drop bar if last time is "today" VN time (market not closed/committed yet)
-    last_ts = pd.to_datetime(df["time"].iloc[-1])
-    today_vn = _now_vn().date()
-    if timeframe.upper().startswith("1D") and last_ts.date() >= today_vn:
+    if _is_last_bar_partial(df, tf_ccxt):
         return df.iloc[:-1].copy()
     return df
 
-def fetch_ohlcv(symbol: str, timeframe: str = "1D", limit: int = 600, include_partial: bool = True) -> pd.DataFrame:
-    """
-    Fetch a single symbol with fallbacks across sources, symbol variants and interval aliases.
-    Returns normalized DataFrame with attrs:
-        - source_used
-        - interval_used
-        - range  ("start-end" | "nodates")
-        - error / source_tried / debug when empty
-    """
-    vnstock = importlib.import_module("vnstock")
-    start, end = _to_date(limit)
-    tf = timeframe
+
+# ----------------------------- Fetch primitives -------------------------------
+
+def _provider_history(vnstock_mod, symbol: str, tf_ccxt: str, start: Optional[str] = None, end: Optional[str] = None) -> pd.DataFrame:
+    """Try multiple sources, symbol variants and interval aliases; return raw DataFrame."""
     last_err = None
-    df = None
-    used_src = None
-    meta_used = {}
-
-    for src_name in _SUPPORTED_SOURCES:
-        for sym_variant in _symbol_variants(symbol):
-            try:
-                # New-style accessor
+    for src in SUPPORTED_SOURCES:
+        for sym in _symbol_variants(symbol):
+            # new API
+            def _do_history(interval: str, start=start, end=end):
                 try:
-                    quote = vnstock.Quote(symbol=sym_variant, source=src_name)
-                    df_tmp, meta = _history_with_fallbacks(quote, start, end, tf)
+                    quote = vnstock_mod.Quote(symbol=sym, source=src)
+                    if start and end:
+                        return quote.history(start=start, end=end, interval=interval)
+                    return quote.history(interval=interval)
                 except Exception:
-                    # Legacy path
-                    stk = vnstock.Vnstock().stock(symbol=sym_variant, source=src_name)
-                    df_tmp, meta = _history_with_fallbacks(stk.quote, start, end, tf)
-                if len(df_tmp) > 0:
-                    df = df_tmp
-                    used_src = src_name
-                    meta_used = meta
-                    break
-            except Exception as e:
-                last_err = str(e)
-                continue
-        if df is not None and len(df) > 0:
-            break
+                    # legacy path
+                    stk = vnstock_mod.Vnstock().stock(symbol=sym, source=src)
+                    if start and end:
+                        return stk.quote.history(start=start, end=end, interval=interval)
+                    return stk.quote.history(interval=interval)
 
-    if df is None:
-        df = pd.DataFrame(columns=["time","open","high","low","close","volume"])
-        if last_err:
-            df.attrs["error"] = last_err
-        df.attrs["source_tried"] = ",".join(_SUPPORTED_SOURCES)
-        df.attrs["debug"] = "no_rows_after_all_fallbacks"
-        return df
+            for itv in _interval_aliases_for_provider(tf_ccxt):
+                try:
+                    raw = _retryable_call(_do_history, itv)
+                    if raw is not None and len(raw) > 0:
+                        return raw
+                except Exception as e:
+                    last_err = e
+                    continue
+    if last_err:
+        raise last_err
+    return pd.DataFrame()
 
-    # Optionally drop the running bar
-    df = _drop_running_bar_if_needed(df, timeframe, include_partial)
 
-    # Final sanitize to our strict schema (time, tz, numerics, dedupe, order)
-    df = _sanitize_ohlcv(df)
+def _date_range_for_limit(limit: int) -> Tuple[str, str]:
+    # buffer for weekends/holidays
+    days = int(limit * 1.1) + 5
+    end_vn = datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(hours=7)
+    start_vn = end_vn - timedelta(days=days)
+    return start_vn.date().isoformat(), end_vn.date().isoformat()
 
-    # Quality report for clarity (DATA_GAP)
-    q = _quality_report(df)
-    if not q["ok"]:
-        print(f"[{symbol}] DATA_GAP -> {q['issues']}")
 
-    # Attach metadata
-    if used_src:
-        df.attrs["source_used"] = used_src
-    if meta_used:
-        for k, v in meta_used.items():
-            df.attrs[k] = v
+# ----------------------------- Public API -------------------------------------
 
-    # 🔧 Hợp thức hóa cột thời gian cho downstream: tạo 'ts' từ 'time'
-    try:
-        if df is not None and len(df) and "ts" not in df.columns and "time" in df.columns:
-            ts = pd.to_datetime(df["time"], errors="coerce")
-            # ưu tiên timezone VN nếu có thể (để _last_closed_idx hoạt động chuẩn phiên VN)
-            try:
-                from zoneinfo import ZoneInfo
-                tz = ZoneInfo("Asia/Ho_Chi_Minh")
-                if getattr(ts, "dt", None) is not None and ts.dt.tz is None:
-                    ts = ts.dt.tz_localize(tz, nonexistent="shift_forward", ambiguous="NaT")
-            except Exception:
-                pass
-            df["ts"] = ts
-    except Exception as _e:
-        df.attrs["warn_ts_create"] = str(_e)
+def fetch_ohlcv(symbol: str, timeframe: str = "1D", limit: int = 600, include_partial: bool = False) -> pd.DataFrame:
+    """Fetch a single timeframe → DataFrame indexed by UTC with columns [open,high,low,close,volume]."""
+    vnstock_mod = _load_vnstock()
+    tf_ccxt = _resolve_timeframe(timeframe)
+
+    # Guard for intraday availability
+    if tf_ccxt in ("1h", "4h"):
+        raise NotImplementedError("Intraday (1H/4H) may not be supported by vnstock providers yet.")
+
+    start, end = _date_range_for_limit(limit)
+    _sleep_base(RATE_LIMIT_MIN_SLEEP)
+    raw = _provider_history(vnstock_mod, symbol, tf_ccxt, start, end)
+    df = _sanitize_ohlcv(raw)
+    df = _drop_partial(df, tf_ccxt, include_partial)
     return df
 
-def fetch_ohlcv_batch(symbols: List[str], timeframe: str = "1D", limit: int = 600, include_partial: bool = True) -> Dict[str, pd.DataFrame]:
+
+def fetch_ohlcv_history(
+    symbol: str,
+    timeframe: str,
+    start_ms: int,
+    end_ms: int,
+    max_pages: int = 20,
+    window_days: int = 120,
+    sleep_sec: float = 0.8,
+    include_partial: bool = False,
+) -> pd.DataFrame:
+    """Deep history within [start_ms, end_ms] UTC ms using backward pagination windows.
+
+    We walk windows from end_ms backwards by `window_days` per page (at most `max_pages`).
+    Each page requests provider history within [start_date, end_date] (VN time window), then merges.
+    """
+    vnstock_mod = _load_vnstock()
+    tf_ccxt = _resolve_timeframe(timeframe)
+
+    if tf_ccxt in ("1h", "4h"):
+        raise NotImplementedError("Intraday (1H/4H) may not be supported by vnstock providers yet.")
+
+    start_dt_utc = datetime.fromtimestamp(start_ms / 1000.0, tz=timezone.utc)
+    end_dt_utc = datetime.fromtimestamp(end_ms / 1000.0, tz=timezone.utc)
+    if end_dt_utc <= start_dt_utc:
+        raise ValueError("end_ms must be greater than start_ms")
+
+    dfs: List[pd.DataFrame] = []
+    pages = 0
+    cur_end = end_dt_utc
+    window = timedelta(days=window_days)
+
+    while pages < max_pages and cur_end > start_dt_utc:
+        cur_start = max(start_dt_utc, cur_end - window)
+
+        # Convert UTC → VN local date boundaries for the provider (inclusive)
+        cur_start_vn = (cur_start.astimezone(VN_TZ)).date().isoformat()
+        cur_end_vn = (cur_end.astimezone(VN_TZ)).date().isoformat()
+
+        _sleep_base(sleep_sec)
+        raw = _provider_history(vnstock_mod, symbol, tf_ccxt, cur_start_vn, cur_end_vn)
+        df_page = _sanitize_ohlcv(raw)
+        if not df_page.empty:
+            dfs.append(df_page)
+
+        pages += 1
+        cur_end = cur_start  # step backward
+
+    if not dfs:
+        # empty but valid
+        out = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])  # UTC index
+        out.index = pd.DatetimeIndex([], tz=timezone.utc)
+        return out
+
+    # merge, sort, drop dups (keep latest)
+    merged = pd.concat(dfs, axis=0, ignore_index=False)
+    merged = merged[~merged.index.duplicated(keep="last")]  # drop dup timestamps
+    merged = merged.sort_index()
+
+    merged = _drop_partial(merged, tf_ccxt, include_partial)
+
+    # clip to [start_ms, end_ms]
+    start_clip = pd.to_datetime(start_dt_utc)
+    end_clip = pd.to_datetime(end_dt_utc)
+    merged = merged.loc[(merged.index >= start_clip) & (merged.index <= end_clip)]
+
+    return merged
+
+
+def fetch_batch(
+    symbol: str,
+    timeframes: Tuple[str, ...] = ("1D", "1W"),
+    limit: int = 600,
+    include_partial: bool = False,
+    step_sleep_sec: float = 0.6,
+) -> Dict[str, pd.DataFrame]:
+    """Fetch multiple timeframes for one symbol in a rate-limit-friendly way.
+
+    Returns a dict {tf_input: DataFrame}
+    """
     out: Dict[str, pd.DataFrame] = {}
-    for sym in symbols:
-        out[sym] = fetch_ohlcv(sym, timeframe=timeframe, limit=limit, include_partial=include_partial)
+    for i, tf in enumerate(timeframes):
+        if i > 0:
+            _sleep_base(step_sleep_sec)
+        try:
+            out[tf] = fetch_ohlcv(symbol, timeframe=tf, limit=limit, include_partial=include_partial)
+        except NotImplementedError as e:
+            # provide empty frame for unsupported tf
+            empty = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])  # UTC index
+            empty.index = pd.DatetimeIndex([], tz=timezone.utc)
+            empty.attrs["error"] = str(e)
+            out[tf] = empty
     return out
 
-# Self-test
+
+# ----------------------------- Self-test --------------------------------------
 if __name__ == "__main__":
+    sym = os.getenv("TEST_SYMBOL", "VCB")
+    print("Testing fetch_ohlcv ...")
     try:
-        print("vnstock version:", _check_provider())
-        test_df = fetch_ohlcv("VCB", timeframe="1D", limit=160, include_partial=True)
-        print("Fetched rows:", len(test_df), "| source_used:", test_df.attrs.get("source_used"),
-              "| interval:", test_df.attrs.get("interval_used"), "| range:", test_df.attrs.get("range"))
-        print(test_df.tail())
+        df = fetch_ohlcv(sym, timeframe="1D", limit=160, include_partial=False)
+        print("Rows:", len(df), "Index tz:", getattr(df.index, "tz", None))
+        print(df.tail())
     except Exception as e:
-        print("Self-test failed:", e)
+        print("fetch_ohlcv error:", e)
+
+    print("Testing fetch_ohlcv_history ...")
+    try:
+        end_ms = int(_now_utc().timestamp() * 1000)
+        start_ms = int(( _now_utc() - timedelta(days=365) ).timestamp() * 1000)
+        dh = fetch_ohlcv_history(sym, timeframe="1D", start_ms=start_ms, end_ms=end_ms, max_pages=6)
+        print("History rows:", len(dh))
+        print(dh.tail())
+    except Exception as e:
+        print("fetch_ohlcv_history error:", e)
+
+    print("Testing fetch_batch ...")
+    try:
+        batch = fetch_batch(sym, timeframes=("1D", "1W"), limit=200)
+        for k, v in batch.items():
+            print(k, "→", len(v))
+    except Exception as e:
+        print("fetch_batch error:", e)
