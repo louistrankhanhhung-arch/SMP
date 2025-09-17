@@ -480,16 +480,17 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
     ev_dir = ev.get("direction") if isinstance(ev, dict) else None
     # build validator benchmark strings up front so all return paths can include them
     try:
-        try:
-            rep = (ev.get("validator_report") if isinstance(ev, dict) else {}) or {}
-            # Defaults to avoid 'nan>=nan' when validator_report is missing
-            rep = rep or {}
-            rep.setdefault('volume', {}).setdefault('thresholds', {'vol_ratio_ok': 1.2, 'vol_z_ok': 0.5})
-            rep.setdefault('momentum', {}).setdefault('thresholds', {'macd_hist_delta_min': 0.0, 'rsi_fast_trigger': 55.0})
-            rep.setdefault('candles', {}).setdefault('thresholds', {'atr_push_min': 0.6, 'body_pct_ok': 0.35})
-            _validator_line = _build_validator_line(rep)
-            _validator_checklist = _build_checklist(rep)
-        except Exception: _validator_line = ""; _validator_checklist = ""
+        rep = (ev.get("validator_report") if isinstance(ev, dict) else {}) or {}
+        # Defaults to avoid 'nan>=nan' when validator_report is missing
+        rep = rep or {}
+        rep.setdefault('volume', {}).setdefault('thresholds', {'vol_ratio_ok': 1.2, 'vol_z_ok': 0.5})
+        rep.setdefault('momentum', {}).setdefault('thresholds', {'macd_hist_delta_min': 0.0, 'rsi_fast_trigger': 55.0})
+        rep.setdefault('candles', {}).setdefault('thresholds', {'atr_push_min': 0.6, 'body_pct_ok': 0.35})
+        _validator_line = _build_validator_line(rep)
+        _validator_checklist = _build_checklist(rep)
+    except Exception:
+        _validator_line = ""
+        _validator_checklist = ""
     out: Dict[str, Any] = {
         "symbol": sym,
         "timeframe_primary": cfg["primary_tf"],
@@ -612,7 +613,8 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
             out['validator_report'] = rep
             bench_line = _build_validator_line(rep)
             checklist  = _build_checklist(rep)
-            out['validator_line'] = bench_line; out['validator_checklist'] = checklist
+            out["validator_line"] = bench_line
+            out["validator_checklist"] = checklist
             log_info(f"[{out['symbol']}] VALIDATORS | {bench_line} | {checklist}")
 
         # NEW: vẫn phát hành setup khi WAIT nếu state được cho phép
@@ -644,8 +646,8 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
                     pass
                 out["notes"].append("setup_on_WAIT: emitted plan for bullish_potential (idea only)")
             # ensure validator strings present even if no setup emitted
-            out.setdefault("validator_line", _validator_line)
-            out.setdefault("validator_checklist", _validator_checklist)  
+            out["validator_line"] = _validator_line
+            out["validator_checklist"] = _validator_checklist  
 
         reason = ",".join(out["missing"]) if out.get("missing") else "missing_features"
         notes = "; ".join(out.get("notes", [])) if out.get("notes") else ""
