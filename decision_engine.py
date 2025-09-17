@@ -589,13 +589,13 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
         # Khi có setup (WAIT/SETUP), vẫn in benchmark để bạn theo dõi
         if DEBUG_VALIDATORS:
             rep = ev.get("validator_report", {})
-        # Defaults to avoid 'nan>=nan' when validator_report is missing
-        rep = rep or {}
-        rep.setdefault("volume", {}).setdefault("thresholds", {"vol_ratio_ok": 1.2, "vol_z_ok": 0.5})
-        rep.setdefault("momentum", {}).setdefault("thresholds", {"macd_hist_delta_min": 0.0, "rsi_fast_trigger": 55.0})
-        rep.setdefault("candles", {}).setdefault("thresholds", {"atr_push_min": 0.6, "body_pct_ok": 0.35})
-        # Expose to main.format_plan
-        out["validator_report"] = rep
+            # Defaults to avoid 'nan>=nan' when validator_report is missing
+            rep = rep or {}
+            rep.setdefault("volume", {}).setdefault("thresholds", {"vol_ratio_ok": 1.2, "vol_z_ok": 0.5})
+            rep.setdefault("momentum", {}).setdefault("thresholds", {"macd_hist_delta_min": 0.0, "rsi_fast_trigger": 55.0})
+            rep.setdefault("candles", {}).setdefault("thresholds", {"atr_push_min": 0.6, "body_pct_ok": 0.35})
+            # Expose to main.format_plan
+            out["validator_report"] = rep
             bench_line = _build_validator_line(rep)
             checklist  = _build_checklist(rep)
             log_info(f"[{out['symbol']}] VALIDATORS | {bench_line} | {checklist}")
