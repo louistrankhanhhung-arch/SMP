@@ -95,7 +95,6 @@ def _debug_dump_validators(symbol: str, f1d: dict, confirmations: dict):
 
 def _safe_eval(features_all):
     if _evaluate is None:
-        log_warn("Evaluator not available: evidence_evaluators.evaluate import failed.")
         return None
     try:
         # TH1: evaluator nhận keyword 'features_by_tf'
@@ -104,11 +103,9 @@ def _safe_eval(features_all):
         # TH2: evaluator chỉ nhận 1 positional
         try:
             return _evaluate(features_all)
-        except Exception as e:
-            log_warn(f"Evaluator raised: {e}")
+        except Exception:
             return None
-    except Exception as e:
-        log_warn(f"Evaluator raised: {e}")
+    except Exception:
         return None
 
 # =========================
@@ -483,11 +480,16 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
     ev_dir = ev.get("direction") if isinstance(ev, dict) else None
     # build validator benchmark strings up front so all return paths can include them
     try:
-        rep = (ev.get("validator_report") if isinstance(ev, dict) else {}) or {}
-        _validator_line = _build_validator_line(rep)
-        _validator_checklist = _build_checklist(rep)
-    except Exception: _validator_line = ""; _validator_checklist = ""
-      
+        try:
+            rep = (ev.get("validator_report") if isinstance(ev, dict) else {}) or {}
+            # Defaults to avoid 'nan>=nan' when validator_report is missing
+            rep = rep or {}
+            rep.setdefault('volume', {}).setdefault('thresholds', {'vol_ratio_ok': 1.2, 'vol_z_ok': 0.5})
+            rep.setdefault('momentum', {}).setdefault('thresholds', {'macd_hist_delta_min': 0.0, 'rsi_fast_trigger': 55.0})
+            rep.setdefault('candles', {}).setdefault('thresholds', {'atr_push_min': 0.6, 'body_pct_ok': 0.35})
+            _validator_line = _build_validator_line(rep)
+            _validator_checklist = _build_checklist(rep)
+        except Exception: _validator_line = ""; _validator_checklist = ""
     out: Dict[str, Any] = {
         "symbol": sym,
         "timeframe_primary": cfg["primary_tf"],
@@ -535,8 +537,15 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
         notes = "; ".join(out.get("notes", [])) if out.get("notes") else ""
         # still log internally; plus we've exported strings above for main.py
         rep = ev.get("validator_report", {})
+        # Defaults to avoid 'nan>=nan' when validator_report is missing
+        rep = (rep or {})
+        rep.setdefault('volume', {}).setdefault('thresholds', {'vol_ratio_ok': 1.2, 'vol_z_ok': 0.5})
+        rep.setdefault('momentum', {}).setdefault('thresholds', {'macd_hist_delta_min': 0.0, 'rsi_fast_trigger': 55.0})
+        rep.setdefault('candles', {}).setdefault('thresholds', {'atr_push_min': 0.6, 'body_pct_ok': 0.35})
+        out['validator_report'] = rep
         bench_line = _build_validator_line(rep)
         checklist  = _build_checklist(rep)
+        out["validator_line"] = bench_line; out["validator_checklist"] = checklist
         log_info(
             f"[{out['symbol']}] DECISION=WAIT | STATE={out.get('STATE')} | DIR={out.get('DIRECTION')} | "
             f"reason={reason} | confirm:V={V_ok} M={M_ok} C={C_ok} | {bench_line} | {checklist} | "
@@ -583,23 +592,28 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
     if not can_enter:
         _conf = out["confirmations"]
         V_ok = bool(_conf.get("volume", False))
+        # Defaults to avoid 'nan>=nan' when validator_report is missing
+        rep = (rep or {})
+        rep.setdefault('volume', {}).setdefault('thresholds', {'vol_ratio_ok': 1.2, 'vol_z_ok': 0.5})
+        rep.setdefault('momentum', {}).setdefault('thresholds', {'macd_hist_delta_min': 0.0, 'rsi_fast_trigger': 55.0})
+        rep.setdefault('candles', {}).setdefault('thresholds', {'atr_push_min': 0.6, 'body_pct_ok': 0.35})
+        out['validator_report'] = rep
         M_ok = bool(_conf.get("momentum", False))
         C_ok = bool(_conf.get("candles", False))
         out["confirm"] = {"V": V_ok, "M": M_ok, "C": C_ok}
         # Khi có setup (WAIT/SETUP), vẫn in benchmark để bạn theo dõi
         if DEBUG_VALIDATORS:
-            rep = ev.get("validator_report", {})
+            rep = ev.get('validator_report', {})
             # Defaults to avoid 'nan>=nan' when validator_report is missing
-            rep = rep or {}
-            rep.setdefault("volume", {}).setdefault("thresholds", {"vol_ratio_ok": 1.2, "vol_z_ok": 0.5})
-            rep.setdefault("momentum", {}).setdefault("thresholds", {"macd_hist_delta_min": 0.0, "rsi_fast_trigger": 55.0})
-            rep.setdefault("candles", {}).setdefault("thresholds", {"atr_push_min": 0.6, "body_pct_ok": 0.35})
-            # Expose to main.format_plan
-            out["validator_report"] = rep
+            rep = (rep or {})
+            rep.setdefault('volume', {}).setdefault('thresholds', {'vol_ratio_ok': 1.2, 'vol_z_ok': 0.5})
+            rep.setdefault('momentum', {}).setdefault('thresholds', {'macd_hist_delta_min': 0.0, 'rsi_fast_trigger': 55.0})
+            rep.setdefault('candles', {}).setdefault('thresholds', {'atr_push_min': 0.6, 'body_pct_ok': 0.35})
+            out['validator_report'] = rep
             bench_line = _build_validator_line(rep)
             checklist  = _build_checklist(rep)
+            out['validator_line'] = bench_line; out['validator_checklist'] = checklist
             log_info(f"[{out['symbol']}] VALIDATORS | {bench_line} | {checklist}")
-        _debug_dump_validators(out["symbol"], f1d, out.get("confirmations", {}))
 
         # NEW: vẫn phát hành setup khi WAIT nếu state được cho phép
         st_lower = (out.get("STATE") or "").lower()
