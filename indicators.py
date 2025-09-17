@@ -1,241 +1,302 @@
 from __future__ import annotations
 
 """
-indicators.py — Core, TradingView‑compatible indicators and enrich helpers
+indicators.py — Core technical indicators and strategy-enrichment utilities
 for Vietnam equities OHLCV DataFrames.
 
-Expected input schema for enrichers: columns ["open","high","low","close","volume"],
-DatetimeIndex (tz‑aware is fine). Returns the same DataFrame with new columns added.
+Input schema (expected):
+    index  : DatetimeIndex (tz-aware preferred)
+    columns: ["open","high","low","close","volume"] as float-like
 
-Design goals
-- Correct per textbook/TradingView behavior where applicable
-- Vectorized Pandas/Numpy for speed; no loops
-- Safe math: avoid divide‑by‑zero, robust to NaNs
+Design goals:
+- TradingView-compatible EMA/RSI (Wilder smoothing via EWMA alpha=1/period)
+- Robust to NaNs / divide-by-zero
+- Easy to reuse in your signal engine
 
-Public API
-- ema(series, span)
+Public API:
 - sma(series, window)
-- rsi(series, period=14)              # Wilder smoothing (alpha = 1/period)
-- atr(df, period=14)                  # TR = max(H-L, |H-Cprev|, |L-Cprev|); Wilder RMA
+- ema(series, span)
+- rma(series, period)  # Wilder's RMA via EWM(alpha=1/period)
+- rsi(series, period=14)
+- atr(df, period=14)
 - bollinger(series, window=20, num_std=2.0) -> (upper, mid, lower)
 - rolling_zscore(series, window=20)
 - enrich_indicators(df)
 - enrich_more(df)
+- calc_vp(df, window_bars=120, bins=24, top_k=5)  # volume profile zones
+
+All functions return new Series/DataFrames aligned to the input index, leaving
+original inputs unmodified.
 """
 
 import numpy as np
 import pandas as pd
-from typing import Tuple
+from typing import Tuple, List
 
-# ---------- Core building blocks ----------
+# -----------------------------
+# Helpers
+# -----------------------------
 
-def _to_float_series(x: pd.Series) -> pd.Series:
-    s = pd.to_numeric(x, errors="coerce")
-    return s.astype(float)
+def _to_series(x: pd.Series | pd.DataFrame) -> pd.Series:
+    if isinstance(x, pd.DataFrame):
+        if x.shape[1] != 1:
+            raise ValueError("Expected a single-column DataFrame or a Series")
+        return x.iloc[:, 0]
+    return x
 
+
+def _safe_div(numer: pd.Series, denom: pd.Series) -> pd.Series:
+    out = numer.astype(float) / denom.replace(0, np.nan).astype(float)
+    return out.replace([np.inf, -np.inf], np.nan)
+
+
+# -----------------------------
+# Core Indicators (correct & reusable)
+# -----------------------------
 
 def sma(series: pd.Series, window: int) -> pd.Series:
-    """Simple Moving Average (TV‑compatible)."""
-    s = _to_float_series(series)
+    """Simple Moving Average."""
+    s = _to_series(series).astype(float)
     return s.rolling(window=window, min_periods=window).mean()
 
 
 def ema(series: pd.Series, span: int) -> pd.Series:
-    """Exponential Moving Average using Pandas ewm with adjust=False (TradingView‑style).
-    Note: TV initializes EMA from the first value; using adjust=False yields same recursive form.
+    """Exponential Moving Average (TradingView-compatible default).
+
+    Notes: adjust=False to use recursive formula; no bias correction.
     """
-    s = _to_float_series(series)
-    # No min_periods to follow TV behavior of early warm‑up
+    s = _to_series(series).astype(float)
     return s.ewm(span=span, adjust=False).mean()
 
 
-def _rma(series: pd.Series, period: int) -> pd.Series:
-    """Wilder's RMA (a.k.a. SMMA) using EWM with alpha=1/period, adjust=False."""
-    s = _to_float_series(series)
+def rma(series: pd.Series, period: int) -> pd.Series:
+    """Wilder's RMA via EWM with alpha=1/period (TV-compatible)."""
+    s = _to_series(series).astype(float)
     alpha = 1.0 / float(period)
     return s.ewm(alpha=alpha, adjust=False).mean()
 
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """RSI with Wilder's smoothing (alpha = 1/period).
-
-    Steps:
-      1) delta = close.diff()
-      2) gain = max(delta, 0), loss = max(-delta, 0)
-      3) avg_gain = RMA(gain, period); avg_loss = RMA(loss, period)
-      4) RS = avg_gain / avg_loss; RSI = 100 - 100/(1+RS)
-    """
-    s = _to_float_series(series)
+    """RSI using Wilder's smoothing (RMA) for better TV parity."""
+    s = _to_series(series).astype(float)
     delta = s.diff()
-
-    gain = delta.clip(lower=0.0)
-    loss = (-delta).clip(lower=0.0)
-
-    avg_gain = _rma(gain, period)
-    avg_loss = _rma(loss, period)
-
-    # Avoid division by zero: where avg_loss==0 and avg_gain==0 => RSI=50; if loss==0 but gain>0 => RSI=100
-    rs = pd.Series(np.where(avg_loss <= 1e-12, np.inf, avg_gain / avg_loss), index=s.index)
-    rsi_val = 100.0 - (100.0 / (1.0 + rs))
-
-    # If both avg_gain and avg_loss ~ 0 (flat series), set RSI=50
-    both_zero = (avg_gain <= 1e-12) & (avg_loss <= 1e-12)
-    rsi_val = rsi_val.where(~both_zero, 50.0)
-    return rsi_val
+    up = delta.clip(lower=0.0)
+    down = (-delta).clip(lower=0.0)
+    rma_up = rma(up, period)
+    rma_dn = rma(down, period)
+    rs = _safe_div(rma_up, rma_dn)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return rsi
 
 
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Average True Range (Wilder).
+    """Average True Range using Wilder's RMA.
 
-    TR = max(high - low, abs(high - prev_close), abs(low - prev_close))
-    ATR = RMA(TR, period)
+    TR = max(
+        high - low,
+        abs(high - prev_close),
+        abs(low  - prev_close)
+    )
     """
-    high = _to_float_series(df["high"]) if "high" in df else None
-    low  = _to_float_series(df["low"]) if "low" in df else None
-    close = _to_float_series(df["close"]) if "close" in df else None
-    if high is None or low is None or close is None:
-        raise ValueError("atr requires columns: high, low, close")
-
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
     prev_close = close.shift(1)
+
     tr1 = (high - low).abs()
     tr2 = (high - prev_close).abs()
     tr3 = (low - prev_close).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return _rma(tr, period)
+    return rma(tr, period)
 
 
 def bollinger(series: pd.Series, window: int = 20, num_std: float = 2.0) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    """Bollinger Bands. std computed with ddof=0 to match many trading platforms.
-    Returns (upper, mid, lower).
-    """
-    s = _to_float_series(series)
-    mid = sma(s, window)
-    # Using ddof=0 via .rolling(...).std(ddof=0)
-    std = s.rolling(window=window, min_periods=window).std(ddof=0)
+    """Bollinger Bands with population std (ddof=0). Returns (upper, mid, lower)."""
+    s = _to_series(series).astype(float)
+    mid = s.rolling(window, min_periods=window).mean()
+    # population std: ddof=0
+    std = s.rolling(window, min_periods=window).std(ddof=0)
     upper = mid + num_std * std
     lower = mid - num_std * std
     return upper, mid, lower
 
 
 def rolling_zscore(series: pd.Series, window: int = 20) -> pd.Series:
-    """Rolling z-score with safe denominator (avoid divide-by-zero)."""
-    s = _to_float_series(series)
-    mean = s.rolling(window=window, min_periods=window).mean()
-    std = s.rolling(window=window, min_periods=window).std(ddof=0)
-    safe_std = std.where(std > 1e-12)
-    z = (s - mean) / safe_std
-    return z.replace([np.inf, -np.inf], np.nan)
+    """(x - mean)/std with ddof=0, avoiding division by zero (returns 0 where std==0)."""
+    s = _to_series(series).astype(float)
+    mean = s.rolling(window, min_periods=window).mean()
+    std = s.rolling(window, min_periods=window).std(ddof=0)
+    z = _safe_div(s - mean, std)
+    return z.fillna(0.0)
 
-# ---------- Enrichers ----------
+
+# -----------------------------
+# Strategy Enrichment
+# -----------------------------
 
 def enrich_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Add core indicators commonly used by strategies.
+    """Add core indicators used broadly by strategies.
 
-    Adds: ema20, ema50, rsi14, bb_upper/mid/lower, bb_width_pct, atr14,
-          vol_sma20, vol_ratio
+    Adds columns:
+        - ema20, ema50, rsi14
+        - bb_upper, bb_mid, bb_lower
+        - bb_width_pct = (upper - lower) / base * 100, base = bb_mid fallback close
+        - atr14
+        - vol_sma20, vol_ratio = volume / vol_sma20
     """
-    if not {"open","high","low","close","volume"}.issubset(df.columns):
-        raise ValueError("enrich_indicators expects columns: open, high, low, close, volume")
-
     out = df.copy()
-    close = _to_float_series(out["close"])
 
-    # Moving averages & RSI
-    out["ema20"] = ema(close, 20)
-    out["ema50"] = ema(close, 50)
-    out["rsi14"] = rsi(close, 14)
+    # Core MAs & RSI
+    out["ema20"] = ema(out["close"], 20)
+    out["ema50"] = ema(out["close"], 50)
+    out["rsi14"] = rsi(out["close"], 14)
 
     # Bollinger
-    bb_u, bb_m, bb_l = bollinger(close, window=20, num_std=2.0)
+    bb_u, bb_m, bb_l = bollinger(out["close"], window=20, num_std=2.0)
     out["bb_upper"], out["bb_mid"], out["bb_lower"] = bb_u, bb_m, bb_l
 
-    # Band width percentage based on mid as primary base, fallback to close if mid==0
+    # Width % with safe base
     base = bb_m.copy()
-    # Where |base| is ~0, fallback to close to avoid division by zero
-    base = base.where(base.abs() > 1e-12, close)
-    out["bb_width_pct"] = (bb_u - bb_l) / base * 100.0
+    base = base.replace(0, np.nan)
+    base = base.fillna(out["close"].replace(0, np.nan))
+    width = (bb_u - bb_l)
+    out["bb_width_pct"] = _safe_div(width, base) * 100.0
 
-    # ATR
+    # ATR14
     out["atr14"] = atr(out, 14)
 
     # Volume features
-    vol = _to_float_series(out["volume"]) if "volume" in out else pd.Series(index=out.index, dtype=float)
-    out["vol_sma20"] = sma(vol, 20)
-    out["vol_ratio"] = vol / out["vol_sma20"]
+    out["vol_sma20"] = sma(out["volume"], 20)
+    out["vol_ratio"] = _safe_div(out["volume"], out["vol_sma20"]).fillna(0.0)
 
     return out
 
 
 def enrich_more(df: pd.DataFrame) -> pd.DataFrame:
-    """Add supplemental features for strategy logic & risk filters.
+    """Additional features for strategies.
 
-    Adds: vol_z20, vol_up, vol_dn, body_pct, upper_wick_pct, lower_wick_pct,
-          sma20, sma50
-
-    Notes:
-      - Candle body/wick % are relative to full range (H-L). Values are clipped to [0, 100].
-      - If H==L (doji/flat), allocate 0 body / 0 wicks to avoid divide-by-zero.
+    Adds columns:
+        - vol_z20, vol_up, vol_dn
+        - body_pct, upper_wick_pct, lower_wick_pct (percent of candle range, clipped 0..100)
+        - sma20, sma50 (soft S/R references)
     """
-    if not {"open","high","low","close","volume"}.issubset(df.columns):
-        raise ValueError("enrich_more expects columns: open, high, low, close, volume")
-
     out = df.copy()
 
-    # Volume z-score & flags
-    vol = _to_float_series(out["volume"]) if "volume" in out else pd.Series(index=out.index, dtype=float)
-    out["vol_z20"] = rolling_zscore(vol, 20)
+    # Volume statistics
+    out["vol_z20"] = rolling_zscore(out["volume"], 20)
+    vol_sma20 = sma(out["volume"], 20)
+    # Volume flags: spike + direction
+    is_spike = out["volume"] > vol_sma20
+    out["vol_up"] = (is_spike & (out["close"] >= out["open"]))
+    out["vol_dn"] = (is_spike & (out["close"] < out["open"]))
 
-    # If vol_sma20 not already present, compute
-    if "vol_sma20" not in out:
-        out["vol_sma20"] = sma(vol, 20)
+    # Candle anatomy
+    o = out["open"].astype(float)
+    h = out["high"].astype(float)
+    l = out["low"].astype(float)
+    c = out["close"].astype(float)
 
-    out["vol_up"] = (vol > out["vol_sma20"]).astype(int)
-    out["vol_dn"] = (vol < out["vol_sma20"]).astype(int)
-
-    # Candle structure in percent
-    o = _to_float_series(out["open"]) ; h = _to_float_series(out["high"]) ; l = _to_float_series(out["low"]) ; c = _to_float_series(out["close"]) 
-    full = (h - l).abs()
-    safe_full = full.where(full > 1e-12)
+    candle_range = (h - l).clip(lower=0.0)
+    # avoid zero range -> use small epsilon to prevent div0; we keep pct=0 when range tiny
+    eps = 1e-12
+    denom = candle_range.where(candle_range > eps, np.nan)
 
     body = (c - o).abs()
-    upper_wick = (h - c.where(c >= o, o))
-    lower_wick = ((o.where(c >= o, c)) - l)
+    upper_wick = (h - np.maximum(o, c))
+    lower_wick = (np.minimum(o, c) - l)
 
-    body_pct = (body / safe_full) * 100.0
-    upper_wick_pct = (upper_wick / safe_full) * 100.0
-    lower_wick_pct = (lower_wick / safe_full) * 100.0
+    body_pct = _safe_div(body, denom) * 100.0
+    upper_wick_pct = _safe_div(upper_wick, denom) * 100.0
+    lower_wick_pct = _safe_div(lower_wick, denom) * 100.0
 
-    # Where full range is ~0, set all to 0
-    zeros = safe_full.isna()
-    body_pct = body_pct.where(~zeros, 0.0)
-    upper_wick_pct = upper_wick_pct.where(~zeros, 0.0)
-    lower_wick_pct = lower_wick_pct.where(~zeros, 0.0)
+    out["body_pct"] = body_pct.clip(lower=0.0, upper=100.0).fillna(0.0)
+    out["upper_wick_pct"] = upper_wick_pct.clip(lower=0.0, upper=100.0).fillna(0.0)
+    out["lower_wick_pct"] = lower_wick_pct.clip(lower=0.0, upper=100.0).fillna(0.0)
 
-    # Clip to reasonable 0..100
-    out["body_pct"] = body_pct.clip(lower=0.0, upper=100.0)
-    out["upper_wick_pct"] = upper_wick_pct.clip(lower=0.0, upper=100.0)
-    out["lower_wick_pct"] = lower_wick_pct.clip(lower=0.0, upper=100.0)
-
-    # Soft SR MAs
-    close = _to_float_series(out["close"]) 
-    out["sma20"] = sma(close, 20)
-    out["sma50"] = sma(close, 50)
+    # Soft S/R SMAs
+    out["sma20"] = sma(out["close"], 20)
+    out["sma50"] = sma(out["close"], 50)
 
     return out
 
 
-# ---------- Quick self-check ----------
-if __name__ == "__main__":
-    # Synthetic example to verify shapes; replace with real OHLCV to test
-    idx = pd.date_range("2024-01-01", periods=120, freq="D", tz="UTC")
-    data = pd.DataFrame({
-        "open": np.linspace(10, 20, 120) + np.random.randn(120)*0.5,
-        "high": np.linspace(10.5, 20.5, 120) + np.random.randn(120)*0.5,
-        "low":  np.linspace(9.5, 19.5, 120) + np.random.randn(120)*0.5,
-        "close":np.linspace(10.2, 20.2, 120) + np.random.randn(120)*0.5,
-        "volume":np.random.randint(1000, 5000, 120).astype(float),
-    }, index=idx)
+# -----------------------------
+# Liquidity zones / Volume Profile
+# -----------------------------
 
-    e1 = enrich_indicators(data)
-    e2 = enrich_more(e1)
-    print(e2.tail(3))
+def calc_vp(df: pd.DataFrame, window_bars: int = 120, bins: int = 24, top_k: int = 5) -> pd.DataFrame:
+    """Compute a simple Volume Profile over the trailing window.
+
+    Steps:
+        1) Use HLC3 = (H+L+C)/3 as representative price per bar
+        2) Bucket prices into `bins` between min..max
+        3) Sum volumes by bucket
+        4) Return top-k zones with columns: [low, high, mid, volume]
+    """
+    if bins < 1 or top_k < 1 or len(df) == 0:
+        return pd.DataFrame(columns=["low","high","mid","volume"])  # empty
+
+    tail = df.tail(int(window_bars)).copy()
+    h = tail["high"].astype(float)
+    l = tail["low"].astype(float)
+    c = tail["close"].astype(float)
+    v = tail["volume"].astype(float).fillna(0.0)
+
+    hlc3 = (h + l + c) / 3.0
+    pmin = float(hlc3.min())
+    pmax = float(hlc3.max())
+    if not np.isfinite(pmin) or not np.isfinite(pmax) or pmax <= pmin:
+        return pd.DataFrame(columns=["low","high","mid","volume"])  # degenerate
+
+    # Bin edges and labels
+    edges = np.linspace(pmin, pmax, num=bins + 1)
+    cats = pd.cut(hlc3, bins=edges, right=False, include_lowest=True)
+
+    vol_by_bin = v.groupby(cats).sum(min_count=1).sort_values(ascending=False)
+    vol_by_bin = vol_by_bin.dropna()
+    if vol_by_bin.empty:
+        return pd.DataFrame(columns=["low","high","mid","volume"])  # empty
+
+    # Build result rows
+    lows: List[float] = []
+    highs: List[float] = []
+    mids: List[float] = []
+    vols: List[float] = []
+
+    for interval, volsum in vol_by_bin.head(top_k).items():
+        low_edge = float(interval.left)
+        high_edge = float(interval.right)
+        mid = (low_edge + high_edge) / 2.0
+        lows.append(low_edge)
+        highs.append(high_edge)
+        mids.append(mid)
+        vols.append(float(volsum))
+
+    res = pd.DataFrame({
+        "low": lows,
+        "high": highs,
+        "mid": mids,
+        "volume": vols,
+    })
+    # Sort by price ascending for convenient display
+    return res.sort_values("low").reset_index(drop=True)
+
+
+# -----------------------------
+# Minimal self-check (optional)
+# -----------------------------
+if __name__ == "__main__":
+    # Quick synthetic check
+    idx = pd.date_range("2024-01-01", periods=300, freq="D", tz="UTC")
+    rng = np.random.default_rng(42)
+    price = pd.Series(np.cumsum(rng.normal(0, 1, size=len(idx))) + 50, index=idx)
+    high = price + rng.uniform(0.5, 1.5, size=len(idx))
+    low = price - rng.uniform(0.5, 1.5, size=len(idx))
+    open_ = price + rng.uniform(-0.5, 0.5, size=len(idx))
+    close = price
+    volume = pd.Series(rng.integers(1e5, 5e5, size=len(idx)), index=idx)
+    df = pd.DataFrame({"open":open_,"high":high,"low":low,"close":close,"volume":volume})
+
+    enriched = enrich_more(enrich_indicators(df))
+    print(enriched.tail(3))
+    print(calc_vp(enriched).head())
