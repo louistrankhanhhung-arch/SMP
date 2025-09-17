@@ -281,6 +281,13 @@ def _date_range_for_limit(limit: int) -> Tuple[str, str]:
 
 
 # ----------------------------- Public API -------------------------------------
+__all__ = [
+    "fetch_ohlcv",
+    "fetch_ohlcv_history",
+    "fetch_batch",
+    "fetch_ohlcv_batch",
+]
+
 
 def fetch_ohlcv(symbol: str, timeframe: str = "1D", limit: int = 600, include_partial: bool = False) -> pd.DataFrame:
     """Fetch a single timeframe → DataFrame indexed by UTC with columns [open,high,low,close,volume]."""
@@ -368,6 +375,60 @@ def fetch_ohlcv_history(
 
 
 def fetch_batch(
+    symbol: str,
+    timeframes: Tuple[str, ...] = ("1D", "1W"),
+    limit: int = 600,
+    include_partial: bool = False,
+    step_sleep_sec: float = 0.6,
+) -> Dict[str, pd.DataFrame]:
+    """Fetch multiple timeframes for one symbol in a rate-limit-friendly way.
+
+    Returns a dict {tf_input: DataFrame}
+    """
+    out: Dict[str, pd.DataFrame] = {}
+    for i, tf in enumerate(timeframes):
+        if i > 0:
+            _sleep_base(step_sleep_sec)
+        try:
+            out[tf] = fetch_ohlcv(symbol, timeframe=tf, limit=limit, include_partial=include_partial)
+        except NotImplementedError as e:
+            # provide empty frame for unsupported tf
+            empty = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])  # UTC index
+            empty.index = pd.DatetimeIndex([], tz=timezone.utc)
+            empty.attrs["error"] = str(e)
+            out[tf] = empty
+    return out
+
+
+def fetch_ohlcv_batch(
+    symbols: List[str],
+    timeframe: str = "1D",
+    limit: int = 600,
+    include_partial: bool = False,
+    step_sleep_sec: float = 0.4,
+) -> Dict[str, pd.DataFrame]:
+    """Batch-fetch *one timeframe* for *many symbols*.
+
+    This matches the expectation in main.py where `fetch_ohlcv_batch(symbols, timeframe=..., ...)`
+    returns a mapping {symbol: DataFrame} and paces requests to avoid 429.
+    """
+    out: Dict[str, pd.DataFrame] = {}
+    symbols = symbols or []
+    for i, sym in enumerate(symbols):
+        if i > 0:
+            _sleep_base(step_sleep_sec)
+        try:
+            df = fetch_ohlcv(sym, timeframe=timeframe, limit=limit, include_partial=include_partial)
+            out[sym] = df
+        except Exception as e:
+            # return empty DF with debug attrs so caller can log
+            empty = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])  # UTC index
+            empty.index = pd.DatetimeIndex([], tz=timezone.utc)
+            empty.attrs["error"] = str(e)
+            empty.attrs["debug"] = f"fetch_ohlcv_failed({sym},{timeframe})"
+            out[sym] = empty
+    return out
+
     symbol: str,
     timeframes: Tuple[str, ...] = ("1D", "1W"),
     limit: int = 600,
