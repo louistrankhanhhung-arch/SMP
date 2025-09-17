@@ -281,27 +281,48 @@ __all__ = [
     "fetch_ohlcv_batch",
 ]
 
+
 def fetch_ohlcv(symbol: str, timeframe: str = "1D", limit: int = 600, include_partial: bool = False) -> pd.DataFrame:
-    """Fetch a single timeframe → DataFrame with columns [time, open,high,low,close,volume] (UTC time col)."""
+    """Fetch a single timeframe → DataFrame with columns [time, open,high,low,close,volume] (UTC time col).
+    NEVER raises provider errors; returns empty DataFrame with attrs['error'] and debug info instead.
+    """
     vnstock_mod = _load_vnstock()
     tf_ccxt = _resolve_timeframe(timeframe)
 
     # Guard for intraday availability
     if tf_ccxt in ("1h", "4h"):
-        raise NotImplementedError("Intraday (1H/4H) may not be supported by vnstock providers yet.")
+        empty = pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+        empty["ts"] = pd.to_datetime([], utc=True)
+        empty.attrs["error"] = "intraday_not_supported"
+        empty.attrs["debug"] = f"fetch_ohlcv_failed({symbol},{timeframe})"
+        return empty
 
+    # Build date window
     start, end = _date_range_for_limit(limit)
     _sleep_base(RATE_LIMIT_MIN_SLEEP)
-    raw = _provider_history(vnstock_mod, symbol, tf_ccxt, start, end)
-    df = _sanitize_ohlcv(raw)
-    df = _drop_partial(df, tf_ccxt, include_partial)
 
-    # add helper ts column
-    if not df.empty:
-        df["ts"] = pd.to_datetime(df["time"], utc=True)
-    else:
+    # Try provider calls with fallbacks; collect trace
+    tried = []
+    try:
+        raw = _provider_history(vnstock_mod, symbol, tf_ccxt, start, end)
+        df = _sanitize_ohlcv(raw)
+        df = _drop_partial(df, tf_ccxt, include_partial)
+
+        # add helper ts column
+        if not df.empty:
+            df["ts"] = pd.to_datetime(df["time"], utc=True)
+        else:
+            df = pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+            df["ts"] = pd.to_datetime([], utc=True)
+        return df
+    except Exception as e:
+        # Return empty but annotated so caller can log the root cause gracefully
+        df = pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
         df["ts"] = pd.to_datetime([], utc=True)
-    return df
+        df.attrs["error"] = str(e)
+        df.attrs["source_tried"] = None  # unknown at this level
+        df.attrs["debug"] = f"fetch_ohlcv_failed({symbol},{timeframe})"
+        return df
 
 
 def fetch_ohlcv_history(
