@@ -72,64 +72,6 @@ try:
 except Exception:
     DEBUG_VALIDATORS = False
 
-def _ensure_minimal_rep(df1d, f1d, rep=None, cfg=None):
-    """Create a minimal validator_report if rep is empty or missing thresholds,
-    so logger strings don't show 'nan'. We only fill thresholds and actuals we can compute.
-    """
-    import math
-    import numpy as _np
-    rep = (rep or {}) if isinstance(rep, dict) else {}
-    # attach sections if missing
-    rep.setdefault("volume", {}).setdefault("actuals", {})
-    rep.setdefault("volume", {}).setdefault("thresholds", {})
-    rep.setdefault("volume", {}).setdefault("sub_criteria", {})
-    rep.setdefault("momentum", {}).setdefault("actuals", {})
-    rep.setdefault("momentum", {}).setdefault("thresholds", {})
-    rep.setdefault("momentum", {}).setdefault("sub_criteria", {})
-    rep.setdefault("candles", {}).setdefault("actuals", {})
-    rep.setdefault("candles", {}).setdefault("thresholds", {})
-    rep.setdefault("candles", {}).setdefault("sub_criteria", {})
-    # defaults
-    _cfg = (cfg or {})
-    def _coalesce(x, d):
-        try:
-            if x is None: return d
-            if isinstance(x, float) and (_np.isnan(x) or _np.isinf(x)): return d
-            return x
-        except Exception:
-            return d
-    vol_ratio_ok = float(_coalesce(_cfg.get('vol_ratio_ok'), 1.2))
-    vol_z_ok     = float(_coalesce(_cfg.get('vol_z_ok'), 0.5))
-    macd_hist_delta_min = float(_coalesce(_cfg.get('macd_hist_delta_min'), 0.0))
-    rsi_fast_trigger    = float(_coalesce(_cfg.get('rsi_fast_trigger'), 55.0))
-    atr_push_min        = float(_coalesce(_cfg.get('atr_push_min'), 0.6))
-    body_pct_ok         = float(_coalesce(_cfg.get('body_pct_ok'), 0.35))
-    # actuals
-    def _g(d, k):
-        v = (d or {}).get(k, _np.nan)
-        try: return float(v)
-        except Exception: return _np.nan
-    vol_ratio = _g(f1d, 'vol_ratio'); vol_z = _g(f1d, 'vol_z')
-    macd_now  = _g(f1d, 'macd_hist'); rsi_now = _g(f1d, 'rsi14')
-    rng=atr14=body=_np.nan
-    try:
-        if isinstance(df1d, type(f1d)) or hasattr(df1d, 'iloc'):
-            idx = -2 if (hasattr(df1d, '__len__') and len(df1d)>1) else -1
-            row = df1d.iloc[idx]
-            rng   = float(row.get('range', _np.nan))
-            atr14 = float(row.get('atr14', _np.nan))
-            body  = float(row.get('body_pct', _np.nan))
-    except Exception:
-        pass
-    # write
-    rep["volume"]["actuals"].update({"vol_ratio": vol_ratio, "vol_z": vol_z})
-    rep["volume"]["thresholds"].update({"vol_ratio_ok": vol_ratio_ok, "vol_z_ok": vol_z_ok})
-    rep["momentum"]["actuals"].update({"macd_now": macd_now, "rsi": rsi_now})
-    rep["momentum"]["thresholds"].update({"macd_hist_delta_min": macd_hist_delta_min, "rsi_fast_trigger": rsi_fast_trigger})
-    rep["candles"]["actuals"].update({"range": rng, "atr14": atr14, "body_pct": body})
-    rep["candles"]["thresholds"].update({"atr_push_min": atr_push_min, "body_pct_ok": body_pct_ok})
-    return rep
-
 def _debug_dump_validators(symbol: str, f1d: dict, confirmations: dict):
     if not DEBUG_VALIDATORS:
         return
@@ -235,6 +177,102 @@ def _fmt_val(x, nd=2):
     except Exception:
         return "nan"
 
+
+def _normalize_validator_report(df1d, rep: dict, cfg: dict) -> dict:
+    """Fill missing thresholds/actuals/sub_criteria/passed and recompute booleans.
+    Also compute macd_delta if missing (from df1d closed bars).
+    """
+    import numpy as _np
+    rep = (rep or {}) if isinstance(rep, dict) else {}
+    cfg = (cfg or {})
+
+    def _tf(v):
+        try: return float(v)
+        except Exception: return _np.nan
+
+    def _co(x, d):
+        try:
+            if x is None: return d
+            if isinstance(x, float) and (_np.isnan(x) or _np.isinf(x)): return d
+            return x
+        except Exception:
+            return d
+
+    # sections
+    v = rep.setdefault("volume", {})
+    m = rep.setdefault("momentum", {})
+    c = rep.setdefault("candles", {})
+    for sec in (v, m, c):
+        sec.setdefault("actuals", {})
+        sec.setdefault("thresholds", {})
+        sec.setdefault("sub_criteria", {})
+
+    # thresholds
+    v_t = v["thresholds"]; m_t = m["thresholds"]; c_t = c["thresholds"]
+    v_t.setdefault("vol_ratio_ok", float(_co(cfg.get("vol_ratio_ok"), 1.2)))
+    v_t.setdefault("vol_z_ok", float(_co(cfg.get("vol_z_ok"), 0.5)))
+    m_t.setdefault("macd_hist_delta_min", float(_co(cfg.get("macd_hist_delta_min"), 0.0)))
+    m_t.setdefault("rsi_fast_trigger", float(_co(cfg.get("rsi_fast_trigger"), 55.0)))
+    c_t.setdefault("atr_push_min", float(_co(cfg.get("atr_push_min"), 0.6)))
+    c_t.setdefault("body_pct_ok", float(_co(cfg.get("body_pct_ok"), 0.35)))
+
+    # actuals
+    v_a = v["actuals"]; m_a = m["actuals"]; c_a = c["actuals"]
+    # fetch missing from df1d if possible
+    try:
+        idx = -1 if (hasattr(df1d, '__len__') and len(df1d)==1) else -2
+        row = df1d.iloc[idx] if (df1d is not None and hasattr(df1d,'iloc') and len(df1d)>0) else {}
+    except Exception:
+        row = {}
+
+    # volume
+    v_a.setdefault("vol_ratio", _tf(v_a.get("vol_ratio")))
+    v_a.setdefault("vol_z", _tf(v_a.get("vol_z")))
+
+    # momentum
+    if "rsi" not in m_a:
+        # fallback from df
+        m_a["rsi"] = _tf(row.get("rsi14"))
+    else:
+        m_a["rsi"] = _tf(m_a.get("rsi"))
+    # macd delta
+    macd_now  = _tf(m_a.get("macd_now", row.get("macd_hist")))
+    if "macd_prev" in m_a:
+        macd_prev = _tf(m_a.get("macd_prev"))
+    else:
+        try:
+            macd_prev = _tf(df1d['macd_hist'].iloc[-3] if len(df1d)>2 else df1d['macd_hist'].iloc[-2])
+        except Exception:
+            macd_prev = _np.nan
+    macd_delta = macd_now - macd_prev if (not _np.isnan(macd_now) and not _np.isnan(macd_prev)) else _np.nan
+    m_a["macd_now"] = macd_now
+    m_a["macd_prev"] = macd_prev
+    m_a["macd_delta"] = _tf(m_a.get("macd_delta", macd_delta))
+
+    # candles
+    c_a.setdefault("range", _tf(c_a.get("range", row.get("range"))))
+    c_a.setdefault("atr14", _tf(c_a.get("atr14", row.get("atr14"))))
+    c_a.setdefault("body_pct", _tf(c_a.get("body_pct", row.get("body_pct"))))
+
+    # sub criteria
+    v_sc = v["sub_criteria"]; m_sc = m["sub_criteria"]; c_sc = c["sub_criteria"]
+    vr_ok = (not _np.isnan(v_a.get("vol_ratio"))) and (v_a["vol_ratio"] >= v_t["vol_ratio_ok"])
+    vz_ok = (not _np.isnan(v_a.get("vol_z"))) and (v_a["vol_z"] >= v_t["vol_z_ok"])
+    md_ok = (not _np.isnan(m_a.get("macd_delta"))) and (m_a["macd_delta"] > m_t["macd_hist_delta_min"])
+    rsi_ok = (not _np.isnan(m_a.get("rsi"))) and (m_a["rsi"] >= m_t["rsi_fast_trigger"] or m_a["rsi"] <= (100.0 - m_t["rsi_fast_trigger"]))
+    push_ok = (not _np.isnan(c_a.get("range")) and not _np.isnan(c_a.get("atr14")) and (c_a["range"] >= c_t["atr_push_min"] * c_a["atr14"]))
+    body_ok = (not _np.isnan(c_a.get("body_pct")) and (c_a["body_pct"] >= c_t["body_pct_ok"]))
+
+    v_sc["vol_ratio_ok"] = bool(vr_ok); v_sc["vol_z_ok"] = bool(vz_ok)
+    m_sc["macd_delta_ok"] = bool(md_ok); m_sc["rsi_bias_ok"] = bool(rsi_ok)
+    c_sc["push_ok"] = bool(push_ok);     c_sc["body_ok"] = bool(body_ok)
+
+    # passed flags
+    v["passed"] = bool(vr_ok or vz_ok)
+    m["passed"] = bool(md_ok or rsi_ok)
+    c["passed"] = bool(push_ok or body_ok)
+
+    return rep
 def _build_validator_line(rep: dict) -> str:
     """Trả về chuỗi ngắn gọn: V: ... | M: ... | C: ... với actual vs threshold và pass/fail"""
     if not isinstance(rep, dict):
@@ -539,7 +577,7 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
     # build validator benchmark strings up front so all return paths can include them
     try:
         rep = (ev.get("validator_report") if isinstance(ev, dict) else {}) or {}
-        rep = _ensure_minimal_rep(df1d, f1d, rep, cfg)
+        rep = _normalize_validator_report(df1d, rep, cfg)
         _validator_line = _build_validator_line(rep)
         _validator_checklist = _build_checklist(rep)
     except Exception: _validator_line = ""; _validator_checklist = ""
@@ -560,6 +598,8 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
         "confirmations": (ev.get("confirmations") if isinstance(ev, dict) else {}) or {},
         # --- NEW: export for top-level logger (main.py) ---
         "validator_line": _validator_line,
+        "validator_checklist": _validator_checklist,
+        "validator_report": rep,
         "validator_checklist": _validator_checklist,
         "confidence": float(ev.get("confidence", 0.0)) if isinstance(ev, dict) else 0.0,
         "min_conf_enter": float(cfg.get("min_conf_enter", 0.55)),
@@ -591,7 +631,6 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
         notes = "; ".join(out.get("notes", [])) if out.get("notes") else ""
         # still log internally; plus we've exported strings above for main.py
         rep = ev.get("validator_report", {})
-        rep = _ensure_minimal_rep(df1d, f1d, rep, cfg)
         # Ensure momentum.actuals.rsi from features/df
         rep = rep or {}
         rep.setdefault('momentum', {}).setdefault('actuals', {})
@@ -604,6 +643,7 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
             _rsi_val = np.nan
         rep['momentum']['actuals']['rsi14'] = _rsi_val
         rep['momentum']['actuals']['rsi'] = _rsi_val
+        rep = _normalize_validator_report(df1d, rep, cfg)
         bench_line = _build_validator_line(rep)
         checklist  = _build_checklist(rep)
         log_info(
@@ -670,8 +710,7 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
         # Khi có setup (WAIT/SETUP), vẫn in benchmark để bạn theo dõi
         if DEBUG_VALIDATORS:
             rep = ev.get("validator_report", {})
-            rep = _ensure_minimal_rep(df1d, f1d, rep, cfg)
-            out["validator_report"] = rep
+            rep = _normalize_validator_report(df1d, rep, cfg)
             bench_line = _build_validator_line(rep)
             checklist  = _build_checklist(rep)
             log_info(f"[{out['symbol']}] VALIDATORS | {bench_line} | {checklist}")
