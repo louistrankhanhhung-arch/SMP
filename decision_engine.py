@@ -72,6 +72,64 @@ try:
 except Exception:
     DEBUG_VALIDATORS = False
 
+def _ensure_minimal_rep(df1d, f1d, rep=None, cfg=None):
+    """Create a minimal validator_report if rep is empty or missing thresholds,
+    so logger strings don't show 'nan'. We only fill thresholds and actuals we can compute.
+    """
+    import math
+    import numpy as _np
+    rep = (rep or {}) if isinstance(rep, dict) else {}
+    # attach sections if missing
+    rep.setdefault("volume", {}).setdefault("actuals", {})
+    rep.setdefault("volume", {}).setdefault("thresholds", {})
+    rep.setdefault("volume", {}).setdefault("sub_criteria", {})
+    rep.setdefault("momentum", {}).setdefault("actuals", {})
+    rep.setdefault("momentum", {}).setdefault("thresholds", {})
+    rep.setdefault("momentum", {}).setdefault("sub_criteria", {})
+    rep.setdefault("candles", {}).setdefault("actuals", {})
+    rep.setdefault("candles", {}).setdefault("thresholds", {})
+    rep.setdefault("candles", {}).setdefault("sub_criteria", {})
+    # defaults
+    _cfg = (cfg or {})
+    def _coalesce(x, d):
+        try:
+            if x is None: return d
+            if isinstance(x, float) and (_np.isnan(x) or _np.isinf(x)): return d
+            return x
+        except Exception:
+            return d
+    vol_ratio_ok = float(_coalesce(_cfg.get('vol_ratio_ok'), 1.2))
+    vol_z_ok     = float(_coalesce(_cfg.get('vol_z_ok'), 0.5))
+    macd_hist_delta_min = float(_coalesce(_cfg.get('macd_hist_delta_min'), 0.0))
+    rsi_fast_trigger    = float(_coalesce(_cfg.get('rsi_fast_trigger'), 55.0))
+    atr_push_min        = float(_coalesce(_cfg.get('atr_push_min'), 0.6))
+    body_pct_ok         = float(_coalesce(_cfg.get('body_pct_ok'), 0.35))
+    # actuals
+    def _g(d, k):
+        v = (d or {}).get(k, _np.nan)
+        try: return float(v)
+        except Exception: return _np.nan
+    vol_ratio = _g(f1d, 'vol_ratio'); vol_z = _g(f1d, 'vol_z')
+    macd_now  = _g(f1d, 'macd_hist'); rsi_now = _g(f1d, 'rsi14')
+    rng=atr14=body=_np.nan
+    try:
+        if isinstance(df1d, type(f1d)) or hasattr(df1d, 'iloc'):
+            idx = -2 if (hasattr(df1d, '__len__') and len(df1d)>1) else -1
+            row = df1d.iloc[idx]
+            rng   = float(row.get('range', _np.nan))
+            atr14 = float(row.get('atr14', _np.nan))
+            body  = float(row.get('body_pct', _np.nan))
+    except Exception:
+        pass
+    # write
+    rep["volume"]["actuals"].update({"vol_ratio": vol_ratio, "vol_z": vol_z})
+    rep["volume"]["thresholds"].update({"vol_ratio_ok": vol_ratio_ok, "vol_z_ok": vol_z_ok})
+    rep["momentum"]["actuals"].update({"macd_now": macd_now, "rsi": rsi_now})
+    rep["momentum"]["thresholds"].update({"macd_hist_delta_min": macd_hist_delta_min, "rsi_fast_trigger": rsi_fast_trigger})
+    rep["candles"]["actuals"].update({"range": rng, "atr14": atr14, "body_pct": body})
+    rep["candles"]["thresholds"].update({"atr_push_min": atr_push_min, "body_pct_ok": body_pct_ok})
+    return rep
+
 def _debug_dump_validators(symbol: str, f1d: dict, confirmations: dict):
     if not DEBUG_VALIDATORS:
         return
@@ -481,6 +539,7 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
     # build validator benchmark strings up front so all return paths can include them
     try:
         rep = (ev.get("validator_report") if isinstance(ev, dict) else {}) or {}
+        rep = _ensure_minimal_rep(df1d, f1d, rep, cfg)
         _validator_line = _build_validator_line(rep)
         _validator_checklist = _build_checklist(rep)
     except Exception: _validator_line = ""; _validator_checklist = ""
@@ -532,6 +591,7 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
         notes = "; ".join(out.get("notes", [])) if out.get("notes") else ""
         # still log internally; plus we've exported strings above for main.py
         rep = ev.get("validator_report", {})
+        rep = _ensure_minimal_rep(df1d, f1d, rep, cfg)
         # Ensure momentum.actuals.rsi from features/df
         rep = rep or {}
         rep.setdefault('momentum', {}).setdefault('actuals', {})
@@ -610,6 +670,8 @@ def decide(features_by_tf: Dict[str, dict], evidence: dict | None = None, *, cfg
         # Khi có setup (WAIT/SETUP), vẫn in benchmark để bạn theo dõi
         if DEBUG_VALIDATORS:
             rep = ev.get("validator_report", {})
+            rep = _ensure_minimal_rep(df1d, f1d, rep, cfg)
+            out["validator_report"] = rep
             bench_line = _build_validator_line(rep)
             checklist  = _build_checklist(rep)
             log_info(f"[{out['symbol']}] VALIDATORS | {bench_line} | {checklist}")
