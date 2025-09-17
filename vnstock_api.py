@@ -28,6 +28,7 @@ What this module provides
                          sleep_sec=0.8, include_partial=False)
    • fetch_batch(symbol, timeframes=("1D","1W"), limit=600, include_partial=False,
                  step_sleep_sec=0.6)  → returns {tf: DataFrame}
+   • fetch_ohlcv_batch(symbols, timeframe="1D", ...) → returns {symbol: DataFrame}
 
 Notes
 - vnstock currently focuses on end-of-day/weekly. Intraday (1H/4H) availability varies by source.
@@ -154,8 +155,7 @@ def _load_vnstock():
 
 def _sanitize_ohlcv(df_in: pd.DataFrame) -> pd.DataFrame:
     if df_in is None or df_in.empty:
-        df = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])  # index later
-        df.index = pd.DatetimeIndex([], tz=timezone.utc)
+        df = pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
         return df
 
     # unify columns
@@ -173,13 +173,9 @@ def _sanitize_ohlcv(df_in: pd.DataFrame) -> pd.DataFrame:
     keep = [c for c in ["time", "open", "high", "low", "close", "volume"] if c in df.columns]
     df = df[keep]
 
-    # time → UTC index
+    # time column
     if "time" not in df.columns:
-        out = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
-        out.index = pd.DatetimeIndex([], tz=timezone.utc)
-        return out
-
-    idx = _to_utc_index(df["time"])  # normalized to UTC
+        return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
 
     # numeric coercion
     for c in ["open", "high", "low", "close", "volume"]:
@@ -191,40 +187,37 @@ def _sanitize_ohlcv(df_in: pd.DataFrame) -> pd.DataFrame:
     # drop invalid OHLC rows
     df = df.dropna(subset=["open", "high", "low", "close"], how="any").copy()
 
-    # assign index, drop dup timestamps keeping the *latest*
-    df.index = idx
-    df = df[~df.index.duplicated(keep="last")]
+    # normalize time to UTC ISO string (keep as column)
+    ts = pd.to_datetime(df["time"], errors="coerce", utc=True)
+    df["time"] = ts.dt.tz_convert(timezone.utc)
 
-    # sort by time asc
-    df = df.sort_index()
+    # drop dup times (keep last), sort asc
+    df = df[~df["time"].duplicated(keep="last")].sort_values("time")
 
     # ensure order and dtypes
-    df = df[["open", "high", "low", "close", "volume"]].astype(float)
-    df.index.name = "time"
+    df = df[["time", "open", "high", "low", "close", "volume"]].astype(
+        {"open": float, "high": float, "low": float, "close": float, "volume": float}
+    )
     return df
 
 
 def _is_last_bar_partial(df: pd.DataFrame, tf_ccxt: str) -> bool:
     if df is None or df.empty:
         return False
-    last_ts = df.index[-1]  # UTC
+    last_ts = df["time"].iloc[-1]  # UTC
     now = _now_utc()
 
     if tf_ccxt == "1h":
-        # complete if last_ts <= floor(now, 1h) - 1h
         closed_edge = now.replace(minute=0, second=0, microsecond=0)
         return last_ts >= closed_edge
     if tf_ccxt == "4h":
-        # 4h windows starting at 00:00 UTC: 00,04,08,12,16,20
         hour_block = (now.hour // 4) * 4
         closed_edge = now.replace(hour=hour_block, minute=0, second=0, microsecond=0)
         return last_ts >= closed_edge
     if tf_ccxt == "1d":
-        # consider bar complete when UTC date has rolled over
         day_edge = now.replace(hour=0, minute=0, second=0, microsecond=0)
         return last_ts >= day_edge
     if tf_ccxt == "1w":
-        # ISO week starts Monday 00:00 UTC
         start_of_week = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
         return last_ts >= start_of_week
     return False
@@ -289,7 +282,7 @@ __all__ = [
 ]
 
 def fetch_ohlcv(symbol: str, timeframe: str = "1D", limit: int = 600, include_partial: bool = False) -> pd.DataFrame:
-    """Fetch a single timeframe → DataFrame indexed by UTC with columns [open,high,low,close,volume]."""
+    """Fetch a single timeframe → DataFrame with columns [time, open,high,low,close,volume] (UTC time col)."""
     vnstock_mod = _load_vnstock()
     tf_ccxt = _resolve_timeframe(timeframe)
 
@@ -302,6 +295,12 @@ def fetch_ohlcv(symbol: str, timeframe: str = "1D", limit: int = 600, include_pa
     raw = _provider_history(vnstock_mod, symbol, tf_ccxt, start, end)
     df = _sanitize_ohlcv(raw)
     df = _drop_partial(df, tf_ccxt, include_partial)
+
+    # add helper ts column
+    if not df.empty:
+        df["ts"] = pd.to_datetime(df["time"], utc=True)
+    else:
+        df["ts"] = pd.to_datetime([], utc=True)
     return df
 
 
@@ -353,23 +352,22 @@ def fetch_ohlcv_history(
         cur_end = cur_start  # step backward
 
     if not dfs:
-        # empty but valid
-        out = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])  # UTC index
-        out.index = pd.DatetimeIndex([], tz=timezone.utc)
+        out = pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+        out["ts"] = pd.to_datetime([], utc=True)
         return out
 
-    # merge, sort, drop dups (keep latest)
-    merged = pd.concat(dfs, axis=0, ignore_index=False)
-    merged = merged[~merged.index.duplicated(keep="last")]  # drop dup timestamps
-    merged = merged.sort_index()
+    # merge, de-dup, sort
+    merged = pd.concat(dfs, axis=0, ignore_index=True)
+    merged = merged.drop_duplicates(subset=["time"], keep="last").sort_values("time")
 
     merged = _drop_partial(merged, tf_ccxt, include_partial)
 
     # clip to [start_ms, end_ms]
-    start_clip = pd.to_datetime(start_dt_utc)
-    end_clip = pd.to_datetime(end_dt_utc)
-    merged = merged.loc[(merged.index >= start_clip) & (merged.index <= end_clip)]
+    start_clip = pd.to_datetime(start_dt_utc, utc=True)
+    end_clip = pd.to_datetime(end_dt_utc, utc=True)
+    merged = merged[(merged["time"] >= start_clip) & (merged["time"] <= end_clip)].copy()
 
+    merged["ts"] = pd.to_datetime(merged["time"], utc=True)
     return merged
 
 
@@ -392,8 +390,8 @@ def fetch_batch(
             out[tf] = fetch_ohlcv(symbol, timeframe=tf, limit=limit, include_partial=include_partial)
         except NotImplementedError as e:
             # provide empty frame for unsupported tf
-            empty = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])  # UTC index
-            empty.index = pd.DatetimeIndex([], tz=timezone.utc)
+            empty = pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+            empty["ts"] = pd.to_datetime([], utc=True)
             empty.attrs["error"] = str(e)
             out[tf] = empty
     return out
@@ -420,8 +418,8 @@ def fetch_ohlcv_batch(
             out[sym] = df
         except Exception as e:
             # return empty DF with debug attrs so caller can log
-            empty = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])  # UTC index
-            empty.index = pd.DatetimeIndex([], tz=timezone.utc)
+            empty = pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+            empty["ts"] = pd.to_datetime([], utc=True)
             empty.attrs["error"] = str(e)
             empty.attrs["debug"] = f"fetch_ohlcv_failed({sym},{timeframe})"
             out[sym] = empty
@@ -434,7 +432,7 @@ if __name__ == "__main__":
     print("Testing fetch_ohlcv ...")
     try:
         df = fetch_ohlcv(sym, timeframe="1D", limit=160, include_partial=False)
-        print("Rows:", len(df), "Index tz:", getattr(df.index, "tz", None))
+        print("Rows:", len(df), "Cols:", list(df.columns))
         print(df.tail())
     except Exception as e:
         print("fetch_ohlcv error:", e)
@@ -442,7 +440,7 @@ if __name__ == "__main__":
     print("Testing fetch_ohlcv_history ...")
     try:
         end_ms = int(_now_utc().timestamp() * 1000)
-        start_ms = int(( _now_utc() - timedelta(days=365) ).timestamp() * 1000)
+        start_ms = int((_now_utc() - timedelta(days=365)).timestamp() * 1000)
         dh = fetch_ohlcv_history(sym, timeframe="1D", start_ms=start_ms, end_ms=end_ms, max_pages=6)
         print("History rows:", len(dh))
         print(dh.tail())
