@@ -57,13 +57,18 @@ def wma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    series = _to_num(series)
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0.0)).rolling(period).mean()
-    loss = (-delta.where(delta < 0, 0.0)).rolling(period).mean()
-    rs = _safe_div(gain, loss)
-    out = 100 - (100 / (1 + rs))
-    return out
+    """
+    RSI với Wilder’s smoothing (RMA, tương đương EWMA alpha=1/period) → sát TradingView.
+    """
+    s = _to_num(series)
+    delta = s.diff()
+    up = delta.clip(lower=0.0)
+    down = (-delta).clip(lower=0.0)
+    # Wilder RMA
+    rma_up = up.ewm(alpha=1/period, adjust=False).mean()
+    rma_down = down.ewm(alpha=1/period, adjust=False).mean()
+    rs = _safe_div(rma_up, rma_down)
+    return 100 - (100 / (1 + rs))
 
 # =========================
 # Volatility
@@ -85,13 +90,26 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
 # Bands & Channels
 # =========================
 def bollinger(series: pd.Series, window: int = 20, num_std: float = 2.0):
+    """
+    Bollinger cơ bản theo yêu cầu: trả về (upper, mid, lower) với std(ddof=0).
+    """
+    s = _to_num(series)
+    mid = s.rolling(window).mean()
+    std = s.rolling(window).std(ddof=0)
+    upper = mid + num_std * std
+    lower = mid - num_std * std
+    return upper, mid, lower
+
+def _bollinger_full(series: pd.Series, window: int = 20, num_std: float = 2.0):
+    """
+    Bản đầy đủ phục vụ enrich: (mid, upper, lower, width_ratio_to_mid, pctb)
+    """
     s = _to_num(series)
     mid = s.rolling(window).mean()
     std = s.rolling(window).std(ddof=0)
     upper = mid + num_std * std
     lower = mid - num_std * std
     width = _safe_div(upper - lower, mid)
-    # %B = (price - lower) / (upper - lower)
     pctb = _safe_div(s - lower, (upper - lower))
     return mid, upper, lower, width, pctb
 
@@ -135,6 +153,19 @@ def cum_vwap(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Serie
     return _safe_div(pv, cv)
 
 # =========================
+# Normalization
+# =========================
+def rolling_zscore(series: pd.Series, window: int = 20) -> pd.Series:
+    """
+    (x - μ) / σ với tránh chia 0 (σ==0 → NaN)
+    """
+    s = _to_num(series)
+    mean = s.rolling(window).mean()
+    std = s.rolling(window).std(ddof=0)
+    z = _safe_div(s - mean, std)
+    return z
+
+# =========================
 # Candle anatomy
 # =========================
 def candle_anatomy(open_, high, low, close):
@@ -152,7 +183,18 @@ def candle_anatomy(open_, high, low, close):
 # =========================
 # Enrichment entrypoint
 # =========================
-def enrich_indicators(df: pd.DataFrame, *, ema_fast: int = 20, ema_slow: int = 50, ema_trend: int = 200, bb_window: int = 20, bb_std: float = 2.0, rsi_period: int = 14, atr_period: int = 14) -> pd.DataFrame:
+def enrich_indicators(
+    df: pd.DataFrame,
+    *,
+    ema_fast: int = 20,
+    ema_slow: int = 50,
+    ema_trend: int = 200,
+    bb_window: int = 20,
+    bb_std: float = 2.0,
+    rsi_period: int = 14,
+    atr_period: int = 14
+) -> pd.DataFrame:
+    
     """Return a copy of df enriched with common indicators.
     Columns added (if input columns exist):
     - ema20, ema50, ema200
@@ -197,13 +239,16 @@ def enrich_indicators(df: pd.DataFrame, *, ema_fast: int = 20, ema_slow: int = 5
     out["macd_signal"] = macd_signal
     out["macd_hist"] = macd_hist
 
-    # Bollinger
-    bb_mid, bb_upper, bb_lower, bb_width, bb_pctb = bollinger(c, window=bb_window, num_std=bb_std)
+    # Bollinger (full for enrich) + bb_width_pct theo base (mid, fallback close)
+    bb_mid, bb_upper, bb_lower, bb_width, bb_pctb = _bollinger_full(c, window=bb_window, num_std=bb_std)
     out["bb_mid"] = bb_mid
     out["bb_upper"] = bb_upper
     out["bb_lower"] = bb_lower
     out["bb_width"] = bb_width
     out["bb_pctb"] = bb_pctb
+    # bb_width_pct = (upper - lower)/base*100; base=bb_mid, fallback close để tránh 0
+    base = bb_mid.where(bb_mid.ne(0) & bb_mid.notna(), other=c)
+    out["bb_width_pct"] = _safe_div((bb_upper - bb_lower), base) * 100
 
     # ATR
     out["atr14"] = atr(h, l, c, period=atr_period)
@@ -225,5 +270,74 @@ def enrich_indicators(df: pd.DataFrame, *, ema_fast: int = 20, ema_slow: int = 5
     out["lower_wick"] = lw
     out["range"] = rng
     out["body_pct"] = body_pct
+    # Volume SMA & ratio
+    out["vol_sma20"] = sma(v, 20)
+    out["vol_ratio"] = _safe_div(v, out["vol_sma20"])
 
     return out
+# =========================
+# Enrich (more)
+# =========================
+def enrich_more(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    - Volume: vol_z20, cờ vol_up/vol_dn (so với vol_sma20)
+    - Cấu trúc nến: body_pct, upper_wick_pct, lower_wick_pct (an toàn chia 0 & clip [0,1])
+    - SMA SR mềm: sma20, sma50 (đảm bảo tồn tại)
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    # Require/ensure columns from enrich_indicators
+    v = _to_num(out.get("volume"))
+    rng = _to_num(out.get("range"))
+    uw = _to_num(out.get("upper_wick"))
+    lw = _to_num(out.get("lower_wick"))
+    if "vol_sma20" not in out.columns:
+        out["vol_sma20"] = sma(v, 20)
+    # z-score volume
+    out["vol_z20"] = rolling_zscore(v, 20)
+    out["vol_up"] = (v > out["vol_sma20"])
+    out["vol_dn"] = (v < out["vol_sma20"])
+    # Candle anatomy pct (clip vào [0,1])
+    out["upper_wick_pct"] = (_safe_div(uw, rng)).clip(lower=0, upper=1)
+    out["lower_wick_pct"] = (_safe_div(lw, rng)).clip(lower=0, upper=1)
+    if "body_pct" in out.columns:
+        out["body_pct"] = out["body_pct"].clip(lower=0, upper=1)
+    # SR mềm
+    c = _to_num(out.get("close"))
+    if "sma20" not in out.columns:
+        out["sma20"] = sma(c, 20)
+    if "sma50" not in out.columns:
+        out["sma50"] = sma(c, 50)
+    return out
+
+# =========================
+# Liquidity zones / Volume Profile
+# =========================
+def calc_vp(df: pd.DataFrame, window_bars: int = 120, bins: int = 24, top_k: int = 5) -> pd.DataFrame:
+    """
+    Dùng HLC3 làm đại diện giá, bucket theo 'bins', cộng dồn volume theo ô.
+    Trả về top-k vùng có tổng volume lớn nhất: [low, high, mid, volume_sum].
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["low", "high", "mid", "volume_sum"])
+    sub = df.tail(window_bars).copy()
+    h, l, c, v = (_to_num(sub.get("high")), _to_num(sub.get("low")),
+                  _to_num(sub.get("close")), _to_num(sub.get("volume")))
+    tp = (h + l + c) / 3.0
+    pr_min, pr_max = tp.min(), tp.max()
+    if pd.isna(pr_min) or pd.isna(pr_max) or pr_min == pr_max:
+        return pd.DataFrame(columns=["low", "high", "mid", "volume_sum"])
+    edges = np.linspace(pr_min, pr_max, bins + 1)
+    # map each bar to a bin index
+    idx = np.clip(np.searchsorted(edges, tp, side="right") - 1, 0, bins - 1)
+    vol_by_bin = pd.Series(v.values, index=idx).groupby(level=0).sum()
+    # build table
+    recs = []
+    for b, vol_sum in vol_by_bin.items():
+        low = edges[b]
+        high = edges[b + 1]
+        mid = (low + high) / 2.0
+        recs.append((low, high, mid, float(vol_sum)))
+    out = pd.DataFrame(recs, columns=["low", "high", "mid", "volume_sum"]).sort_values("volume_sum", ascending=False)
+    return out.head(top_k).reset_index(drop=True)
